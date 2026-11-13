@@ -85,7 +85,7 @@ class _Region:
         self.pkgs = [p for p in range(pr.P) if pr.pgoal[p] in nodeset]
         caps = [pr.tcap[t] for t in self.trucks]
         self.caps = caps
-        self.cmax = max(caps) if caps else 1
+        self.cmax = max(max(caps), 1) if caps else 1
         cm = self.cmax
         self.pbig = {p: (1 if 2 * pr.pw[p] > cm else 0) for p in self.pkgs}
 
@@ -98,7 +98,7 @@ class _Region:
                         edges.append((a, b, -1))
         for f in range(F):
             if n + f in nodeset:
-                for a in pr.fports[f]:
+                for a in pr.gports[f]:
                     edges.append((a, n + f, f))
         adj = {x: [] for x in nodes}
         for i, (u, v, _) in enumerate(edges):
@@ -190,7 +190,8 @@ class _Region:
         # plan does inside could be done at the entrance instead, for less.
         mark = set(pr.s0[1 + t] for t in self.trucks)
         for p in self.pkgs:
-            mark.add(pr.s0[pr.IP + p])
+            if pr.s0[pr.IP + p] in cc:
+                mark.add(pr.s0[pr.IP + p])
             mark.add(pr.pgoal[p])
         live = [0] * (ncc + 1)
         for x in mark:
@@ -301,7 +302,7 @@ class _Region:
                         stack.append(y)
             for x in comp:
                 self.pmask[x] |= 1 << q
-            self.piece_k.append(max(pr.fk[f2] for f2 in served))
+            self.piece_k.append(max(1, max(pr.fk[f2] for f2 in served)))
             self.piece_ferries.append([(f2, frozenset(ports)) for f2, ports in served.items()])
             q += 1
         self.npiece = q
@@ -409,36 +410,34 @@ class _Region:
         return (v & self.WM, (v >> WB) & self.WM, (v >> (2 * WB)) & self.BM, (v >> (2 * WB + BB)) & self.BM, cs, co)
 
     def _crossings(self, wo, wi, bo, bi, cs, co, a, b):
+        """The least zo + zi (crossings out + in) with zo >= a, zi >= b that can carry the weight, exactly.
+
+        If zo >= zi, then d = zo - zi of the crossings out are made by d different trucks that are inside
+        now and have not come in first. They carry at most the d largest capacities inside, and each of
+        the other zi crossings out carries at most cm. Using more such trucks than needed never helps,
+        because no truck is larger than cm. The case zi > zo is the mirror image. cs and co are sorted
+        with the largest capacity first."""
         cm = self.cmax
-        a = max(a, bo)
-        b = max(b, bi)
-        ps = [0]
-        for c in cs:
-            ps.append(ps[-1] + c)
-        po = [0]
-        for c in co:
-            po.append(po[-1] + c)
-
-        def feasible(zo, zi):
-            ok = False
-            for j in range(min(len(cs), zo) + 1):
-                if zo - j <= zi and ps[j] + (zo - j) * cm >= wo:
-                    ok = True
-                    break
-            if not ok:
-                return False
-            for i in range(min(len(co), zi) + 1):
-                if zi - i <= zo and po[i] + (zi - i) * cm >= wi:
-                    return True
-            return False
-
-        total = a + b
-        while total <= 200:         # more is unreachable for a solvable problem
-            for zo in range(a, total - b + 1):
-                if feasible(zo, total - zo):
-                    return total
-            total += 1
-        return a + b
+        # every crossing carries at most cm and at most one big package
+        a = max(a, bo, -(-wo // cm))
+        b = max(b, bi, -(-wi // cm))
+        best = None
+        ps = 0
+        for d in range(len(cs) + 1):            # zo = zi + d
+            zi = max(b, a - d, -(-(wo - ps) // cm))
+            t = 2 * zi + d
+            if best is None or t < best:
+                best = t
+            if d < len(cs):
+                ps += cs[d]
+        po = 0
+        for d in range(1, len(co) + 1):         # zi = zo + d
+            po += co[d - 1]
+            zo = max(a, b - d, -(-(wi - po) // cm))
+            t = 2 * zo + d
+            if t < best:
+                best = t
+        return best
 
     def _first_in(self, v):
         """A side of a road bridge without trucks: extra crossings if the first truck that enters the subtree
@@ -485,7 +484,8 @@ class _Region:
             # ferry may walk in instead, but a truck with cargo brings its cargo back in with it
             free = ndock - len(cargo)
             need = None
-            for m in range(1 << len(cargo)):
+            # every subset gives at least mo - ts - ndock, so this is a valid (weaker) bound without the loop
+            for m in (range(1 << len(cargo)) if len(cargo) <= 10 else ()):
                 ew = eb = cnt = 0
                 for i, c in enumerate(cargo):
                     if (m >> i) & 1:
@@ -495,6 +495,8 @@ class _Region:
                 v = max(-(-(wo + ew) // cm), bo + eb) - ts - free - cnt
                 if need is None or v < need:
                     need = v
+            if need is None:
+                need = mo - ts - ndock
         else:
             d0 = max(-(-mo // k), -(-(mi - to) // k), 0)
             need = mo - ts - ndock
@@ -582,7 +584,7 @@ class _Region:
                                         c[1] += pbig[p]
                         if per:
                             cargo = list(per.values())
-                    c2, boards, disemb = self.port_cost(wo, bo, wi, bi, wn, bn, cargo, ts, ndock, pr.fk[f],
+                    c2, boards, disemb = self.port_cost(wo, bo, wi, bi, wn, bn, cargo, ts, ndock, max(pr.fk[f], 1),
                                                         1 if docked else 0, 0 if docked else 1)
                     total2 += c2
                     if c2:
@@ -931,6 +933,8 @@ class LogisticsProblem(search.Problem):
         self.tcap = [game["Trucks"][t][1] for t in tids]
         self.fports = [tuple(sorted(set(game["Ferries"][f][1]))) for f in fids]
         self.fk = [game["Ferries"][f][2] for f in fids]
+        # for the map graph: a ferry can also be boarded at the port where it starts, served or not
+        self.gports = [tuple(sorted(set(self.fports[i]) | {game["Ferries"][f][0]})) for i, f in enumerate(fids)]
         classes = {}
         self.fcls = [classes.setdefault((self.fports[i], self.fk[i]), len(classes)) for i in range(F)]
         self.pw = [game["Packages"][p][1] for p in pids]
@@ -1002,7 +1006,7 @@ class LogisticsProblem(search.Problem):
             for b in self.adj[a]:
                 group[find(a)] = find(b)
         for f in range(F):
-            for a in self.fports[f]:
+            for a in self.gports[f]:
                 group[find(a)] = find(n + f)
         init = self.s0
         count = {}
@@ -1036,7 +1040,7 @@ class LogisticsProblem(search.Problem):
         cnt = n
         for f in range(F):
             d = {}
-            for a in self.fports[f]:
+            for a in self.gports[f]:
                 d[a] = cnt
                 cnt += 1
             abnode.append(d)
@@ -1048,7 +1052,7 @@ class LogisticsProblem(search.Problem):
             while b:
                 a, b = b, a % b
             lk = lk * k // a
-        cmax = max(self.tcap) if self.tcap else 1
+        cmax = max(max(self.tcap), 1) if self.tcap else 1
         self.den = 2 * cmax * lk
         bridge_road = set()
         bridge_port = set()
@@ -1068,12 +1072,12 @@ class LogisticsProblem(search.Problem):
                 g[a].append((b, 0 if (a, b) in bridge_road else 2 * lk))
         for f in range(F):
             half = 3 * lk // max(self.fk[f], 1)     # half a sail, shared by the trucks aboard
-            for a in self.fports[f]:
+            for a in self.gports[f]:
                 x = abnode[f][a]
                 c = 0 if ((f, a) in bridge_port or roads_only) else 2 * lk
                 g[a].append((x, c))
                 g[x].append((a, c))
-                for b in self.fports[f]:
+                for b in self.gports[f]:
                     if b != a:
                         c2 = 0
                         if not roads_only:
@@ -1494,6 +1498,8 @@ class LogisticsProblem(search.Problem):
         """ This is the heuristic. It gets a node (not a state)
         and returns a goal distance estimate"""
         state = node.state.s
+        if self.dead:
+            return 0            # a package cannot reach its goal: there is no plan at all
         key = state[1:]
         h = self.hcache.get(key)
         if h is None:

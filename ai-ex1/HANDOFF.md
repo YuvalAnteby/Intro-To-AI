@@ -220,3 +220,19 @@ python bench.py                     # all 18 through the official checker
 
 Use a fresh seed range each time (first argument). A `FAIL` line prints the seed and the game dict,
 and `random_game(random.Random(seed))` reproduces it.
+
+## 9. Changes on 2026-11-13 (after an audit for hidden-test robustness)
+
+Sections 1 to 8 describe the version before this date. What changed in `ex1.py`:
+
+* `_crossings` (section 6, part 1) now computes the exact minimum in closed form. The old version stopped
+  searching at 200 crossings and then returned a much smaller number. Results are identical on every input
+  the old version handled, so the 18 problems expand the same number of states.
+* A ferry that starts at a port it does not serve is handled (`gports`). Before, `h` could overestimate there.
+* No division by zero for a ferry of capacity 0 or trucks of capacity 0.
+* No crash when a package cannot reach its goal. The search returns no plan.
+* `_port_cost` no longer enumerates subsets when more than 10 loaded trucks are aboard docked ferries.
+
+New files: `ADMISSIBILITY_PROOF.md` (proof for the heuristic, revision 3) and `validation/` (the test tools,
+see its README). The tool names in section 3 refer to an earlier session and are not in this folder.
+Risk 7.1 is now covered by the proof and by `validation/`. Risk 7.2 (time on y3, y4, y7) is unchanged.

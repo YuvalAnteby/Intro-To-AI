@@ -1,25 +1,24 @@
 # Admissibility proof for `h_astar` in `ex1.py`
 
-Written against `ex1.py` with md5 `053cf25c14d86f3e977ea01bc2daa281` (1,580 lines).
+Written against `ex1.py` with md5 `d6c0f6642e7aa52eec9995d0a083b470`.
 If the heuristic code changes, the matching section here has to be rechecked.
 
-Revision 2 (2026-11-13): three corrections after an external review, listed in section 12. The theorem is unchanged.
+Revision 3 (2026-11-13). Revision 2 corrected three inaccuracies found by an external review. Revision 3
+follows a change of the code: the fixed limit of 200 crossings is gone, and inputs that the assignment's
+wording does not strictly exclude are handled. Section 12 lists everything.
 
 ## 0. The claim
 
-**Theorem.** Let a game satisfy
-
-* **(A1)** every ferry starts docked at one of the ports it serves, and
-* **(A2)** every ferry can carry at least one truck.
-
-Then for every state `s`, `h(s) <= h*(s)`, where `h*(s)` is the cheapest total cost of any sequence of
-legal actions that leads from `s` to a goal state. Also `h` is a non-negative integer and `h = 0` on goals.
+**Theorem.** For every game and every state `s`, `h(s) <= h*(s)`, where `h*(s)` is the cheapest total cost
+of any sequence of legal actions that leads from `s` to a goal state (infinite if there is none).
+Also `h` is a non-negative integer and `h = 0` on goals.
 
 `h*` ranges over **all** legal actions, not only the ones the pruned `successor` generates. Pruning can
 only make the remaining cost larger, so this is at least as strong as anything a grader can measure.
 
-(A1) and (A2) are properties of the input. All 18 given problems satisfy them. Section 9 says what
-happens without them.
+There is no assumption on the input beyond the format of the dictionary. Revisions 1 and 2 needed two
+(every ferry starts at a port it serves, every ferry holds at least one truck). Section 9 says how the
+code now covers them.
 
 ## 1. The model
 
@@ -27,12 +26,13 @@ Fix a state and any plan from it that delivers every package. All counts below (
 refer to this plan.
 
 **Graph G.** Nodes: every location, and one node per ferry. Edges: a *road edge* per road, and a
-*port edge* `(a, f)` for every port `a` that ferry `f` serves. The *node of a truck* is its location, or
+*port edge* `(a, f)` for every port `a` that ferry `f` serves and for the port where `f` starts
+(`gports` in the code, the two coincide when the ferry starts at a port it serves). The *node of a truck* is its location, or
 the ferry it is aboard. The *node of a package* is its location, or the node of the truck that holds it.
 
 * **F1.** DRIVE moves a truck along one road edge. BOARD and DISEMBARK of ferry `f` docked at `a` move a
-  truck along the port edge `(a, f)` (this edge exists by A1, because a ferry is always docked at a port
-  it serves). SAIL, LOAD and UNLOAD move no truck and no package in G.
+  truck along the port edge `(a, f)` (this edge exists, because a ferry is always docked at its start port or
+  at a port it serves). SAIL, LOAD and UNLOAD move no truck and no package in G.
 * **F2.** A package changes node only while it is inside a truck that traverses an edge.
 * **F3.** The weight inside a truck never exceeds its capacity, hence never exceeds `cmax`, the largest
   capacity among the trucks of the region (section 6 uses the largest capacity of the whole game instead,
@@ -107,30 +107,31 @@ out-crossings add up to at least `wo`. The fresh ones carry at most the `j` larg
 together, every other one at most `cmax`.
 (3) Symmetric. ∎
 
-`_crossings(wo, wi, bo, bi, cs, co, a, b)` returns the least `zo + zi` over all pairs with
-`zo >= max(a, bo)`, `zi >= max(b, bi)` that satisfy 2 and 3 (or `a + b` if none below 200, which is
-smaller). So:
-
 Call a pair `(zo, zi)` *feasible for* `(cs, co)` if it satisfies 2 and 3 with these truck lists.
+`_crossings(wo, wi, bo, bi, cs, co, a, b)` returns exactly the least `zo + zi` over the feasible pairs with
+`zo >= max(a, bo)` and `zi >= max(b, bi)`, for any size of the numbers. It does so in closed form:
+
+* Take a pair with `zo >= zi` and put `d = zo - zi`. In 2, the constraint `zo - j <= zi` says `j >= d`, and
+  the left side of the weight inequality does not grow with `j`, because no capacity exceeds `cmax`. So 2
+  holds for some `j` exactly when it holds for `j = d`, which needs `d <= |cs|` and
+  `(d largest of cs) + zi * cmax >= wo`. Statement 3 holds for some `i` exactly when it holds for `i = 0`,
+  that is `zi * cmax >= wi`.
+* So for every `d` in `0..|cs|` the least total is `2 * zi + d` with
+  `zi = max(b', a' - d, ceil((wo - (d largest of cs)) / cmax))`, where `a' = max(a, bo, ceil(wo/cmax))`
+  and `b' = max(b, bi, ceil(wi/cmax))`. The pairs with `zi > zo` are the mirror image.
+
+The code takes the minimum over all these cases. (Checked against an exhaustive search over pairs on
+40,000 random inputs, 2,296 of them needing more than 200 crossings.)
 
 **Corollary 1.** If the pair `(zo, zi)` of the plan is feasible for some truck lists `(cs', co')` and
 `zo >= a`, `zi >= b`, then `_crossings(wo, wi, bo, bi, cs', co', a, b) <= zo + zi`.
 In particular (with the true truck lists, where Lemma 1 gives feasibility) the plan has at least
 `g(v, a, b)` crossings of `e`, and at least `g(v, 0, 0)` DRIVEs over `e`.
 
-*Proof.* The code returns either the least feasible total (at most `zo + zi`, because the pair of the plan
-is one of the candidates) or, when no feasible total up to 200 exists, the fallback `a + b`, which is at
-most `zo + zi` as well. ∎
-
-**Remark (the cutoff).** Adding a truck to `cs` or `co`, or enlarging a capacity, only enlarges the set of
-feasible pairs. The *returned value* is nevertheless not monotone, because of the fallback. Example:
-`cmax = 2`, `wo = 201`, nothing else. With one truck inside the least total is 201, so the code returns 0.
-With two trucks inside it returns 200. For the same reason a difference of two calls, such as
-`g(v, y, 0) - g(v, 0, 0)`, can be negative (the example gives -98 for `y = 102`).
-This proof therefore never uses monotonicity or the sign of a returned value. It uses only Corollary 1,
-which holds for whatever the code returns. A negative difference makes `h` smaller, never larger.
-Corollary 1 would also hold if the fallback were `max(a + b, 201)`, since then no feasible total up to
-200 exists and the plan's own total is at least 201.
+**Remark.** Adding a truck to `cs` or `co`, or enlarging a capacity, only enlarges the set of feasible
+pairs, and raising `a` or `b` only shrinks the set of candidates. Since the returned value is the exact
+minimum, it is monotone in both senses, and `g(v, y, 0) - g(v, 0, 0)` and `g(v, 1, 1) - g(v, 0, 0)` are
+never negative. The proofs below still use only Corollary 1.
 
 Different road bridges are different roads, so the bounds add. ∎
 
@@ -157,7 +158,8 @@ over an edge of E ("in-crossing"). Write P(f) for the ports `a` with `(a, f)` in
 * `cargo`: for each truck aboard such a docked ferry, the weight and big count of its packages whose goal
   is outside S,
 * `ts`: trucks in S, `to = ntrucks - ts`, `ndock`: trucks aboard ferries docked at their P ports,
-* `k`: the largest capacity of the ferries of E, `here` / `away`: ferries of E docked at a P port / not.
+* `k`: the largest capacity of the ferries of E, but at least 1 (a sail still has at most `k` trucks
+  aboard), `here` / `away`: ferries of E docked at a P port / not.
 
 Let `mo = max(ceil(wo/cmax), bo)` and `mi = max(ceil(wi/cmax), bi)`. An *incidence* is a pair
 (sail event, truck aboard during it). A sail has at most `k` incidences.
@@ -219,6 +221,8 @@ also needs such an arrival, unless it is in S now (`ts` trucks) or it is aboard 
 walks in (at most `free + |M|` trucks, where `free = ndock - |cargo|`). So the number of arrival
 incidences is at least `N - ts - free - |M|`, which is at least the minimum over all subsets that
 `_port_cost` computes as `need` (and equals `mo - ts - ndock` when there is no cargo).
+With more than 10 cargo trucks the code skips the subsets and uses `mo - ts - ndock`. That is valid too:
+`N >= mo` and `|M| <= |cargo|`, so `N - ts - free - |M| >= mo - ts - ndock`.
 So `A >= ceil(need / k)`. ∎
 
 *Proof of 3.* For one ferry of E, a sail from a P port to a non-P port is a departure only, the reverse
@@ -242,6 +246,9 @@ sections 4 and 5 already charge to a bridge has length 0. `d_p` is the shortest 
 In this section only, `cmax` is the largest truck capacity of the **whole game** (`max(self.tcap)` in
 `_build_fractions`), not of the region. It is at least the capacity of every truck, so F3 holds with it.
 Using the larger value only makes the bound smaller.
+H is built on `gports`, so it has a node for a ferry at its start port even if it does not serve it.
+The code then also gives H sail edges *into* that port, which no plan can use. Extra edges only shorten
+`d_p`, so the bound only gets smaller.
 
 **Lemma 3.** The cost of the DRIVEs over non-bridge roads, the BOARDs and DISEMBARKs over non-bridge port
 edges and the half-sails of non-bridge pairs is at least `sum over p of (w_p / cmax) * d_p`.
@@ -304,7 +311,6 @@ Apply Lemma 1 to the rest of the plan after σ, with the truck lists `([cap(t)],
 so the pair is also feasible for `([cmax] + cs, co)`, the lists the code uses. By Corollary 1 the rest of
 the plan has at least `_crossings(wo, wi, bo, bi, [cmax] + cs, co, 0, 0)` crossings of `e_X`.
 Together with the crossing at σ: crossings of `e_X` `>= 1 + _crossings(...) = g(v_X,0,0) + first_in(v_X)`.
-(This is an identity in the code's own values, so it holds whether or not a cutoff was hit.)
 
 For the sides of Σ that do not contain `x`, Corollary 1 gives `g(v_X,0,0)`. Summing, the excess over the
 road-bridge term is at least `v(q) >= best`. The mirror case (`first_out`, all trucks inside the subtree)
@@ -342,9 +348,7 @@ crossing toward `g`. Let `y_e` be the number of classes, let `e*` minimise it, a
 
 *Chain.* Every chain bridge has at least `y_e >= y` crossings toward `g`. By Corollary 1 it has at least
 `g(v, y, 0)` crossings in total (road), or at least `y` BOARDs or DISEMBARKs of the right kind (port).
-So the excess over what sections 4 and 5 counted is at least the chain excess for `y`. (Corollary 1 is
-used for the call with `a = y`. The subtracted `g(v,0,0)` is the code's own value, the one section 4
-counted, so this holds even when a cutoff makes the difference negative.)
+So the excess over what sections 4 and 5 counted is at least the chain excess for `y`.
 
 *Merges.* If `y = K` nothing more is claimed. Let `y = y_e* < K`. Call group `i` *paid* if
 (a) every package of the group is loaded or unloaded at least 2 times more than the base term counts, or
@@ -376,12 +380,16 @@ Every bridge that the bound of one goal looks at is marked `used` and is skipped
 first-entry term, and different goals have different packages. So the merge bounds of the goals add, and
 `xfer` is their sum.
 
-## 9. What the assumptions are for
+## 9. Inputs outside the assignment's wording
 
-* **(A1)** If a ferry starts at a port it does not serve, a truck can BOARD there without a port edge, and
-  F1 fails. This is the only input on which my tests found `h > h*` (13 against 9). It contradicts the
-  assignment's definition of a ferry, and no given problem does it.
-* **(A2)** With a ferry of capacity 0, `_port_cost` divides by zero. Not an admissibility issue, a crash.
+* **A ferry that starts at a port it does not serve.** It can be boarded there, and it can leave but never
+  return. G and H contain that port for this ferry (`gports`), so F1 holds as stated. Lemma 2.3 counts the
+  sails that actually happen, so it is unaffected. Sailing targets still come from the served ports only.
+* **A ferry for 0 trucks.** Nobody can board it. The bounds use `max(k, 1)`, which is still an upper bound
+  on the trucks aboard.
+* **Only trucks of capacity 0.** `cmax` is taken as at least 1, still an upper bound on every capacity.
+* **A package that cannot reach its goal** (start and goal in different parts of the map). There is no
+  plan, `h*` is infinite, and the code returns `h = 0` and no successors.
 
 ## 10. Assembly
 
@@ -397,9 +405,9 @@ Let L be the cost of the LOADs and UNLOADs of the plan and M the cost of all oth
 This holds for every plan, hence for the cheapest one: `h <= h*`.
 On a goal state nothing is undelivered, so every term is 0.
 
-`h` is an integer by construction. `h >= 0`: the only terms that can be negative are differences of two
-`_crossings` values (`exo`, `exi`, `road11`, `first_in`, `first_out`), and only when a cutoff is hit.
-Each of them subtracts `g(v,0,0)` of one road bridge and adds at least 0, each bridge enters at most one
+`h` is an integer by construction. `h >= 0`: the only terms that could be negative are differences of two
+`_crossings` values (`first_in` and `first_out`. The others, `exo`, `exi` and `road11`, are non-negative
+by the remark in section 4). Each of them subtracts `g(v,0,0)` of one road bridge and adds at least 0, each bridge enters at most one
 such difference (`used` marks, disjoint private bridges, one side per bridge in section 7), and that
 `g(v,0,0)` is itself part of `T2 / 2`. So the sum is at least `base >= 0`. ∎
 
@@ -411,35 +419,47 @@ evidence for it is the exhaustive test, not this text:
 
 * 2,223 solvable random games, the whole reachable state space enumerated with an independent
   implementation of the rules, exact `h*` for every state: `h <= h*` on 16.5 million world states and on
-  21.1 million successor-reachable states, zero violations.
+  21.1 million successor-reachable states, zero violations. (Re-run on this version of the code.)
+* 515 more solvable games with inputs outside the assignment's wording (ferry starting at a port it does
+  not serve, ferry for 0 trucks, truck of capacity 0): the same checks on 2.9 million world states, zero
+  violations. 683 unsolvable games in total: no plan returned, no crash.
+* Larger games (up to 24 locations, 7 packages, plans up to cost 65), too large to enumerate: 402 games (329 solvable)
+  solved three ways (submitted configuration, heuristic without the first-entry and merge terms, all
+  pruning rules off). Every pair of results that finished agrees on the cost: 402 of 402 for the weaker
+  heuristic, 390 of 390 for no pruning.
 * The cached values go through the same check, so a wrong memo key would show as a violation.
 * On the real problems (p1, p3, x1..x8, y1): no violation on the states of the optimal plans or on about
   320 random reachable states.
 
-Limits: the random games are small (at most 12 locations, 4 packages), and the proof was written by an
-LLM and should be read by a human. Sections 7 and 8 are the ones worth reading most carefully.
+Limits: exact `h*` is only available on small games (at most 12 locations, 4 packages). The larger
+games test the plan cost, not every state. The proof was written by an LLM and should be read by a human. Sections 7 and 8 are the ones worth reading most carefully.
 Consistency of `h` is not claimed and not needed: `graph_search` in `search.py` re-expands a state that
 is reached again with a lower cost.
 
 This document is about the heuristic only. That the pruning rules of `successor` keep an optimal plan is
-a separate claim. It is tested (plan cost equal to the true optimum on about 2,400 random games and on
-the 18 given problems) and not proved here.
+a separate claim. It is tested (plan cost equal to the true optimum on about 2,900 small random games and on the 18 given
+problems, and equal to the cost found with all pruning off on 390 larger games) and not proved here.
 
-## 12. Corrections in revision 2
+## 12. History
 
-An external review of revision 1 found three inaccuracies in the text. None of them changes the theorem.
+**Revision 2** (text only). An external review of revision 1 found three inaccuracies:
 
-1. **Section 4 and 7.** Revision 1 said that the value of `_crossings` does not increase when a truck is
-   added, and section 7 used that. Because of the 200 cutoff this is false for the returned value
-   (example in section 4). Section 7 now uses only that the *set of feasible pairs* grows, together with
-   Corollary 1, which holds for whatever the code returns. Revision 1 also said that all terms are
-   non-negative. Section 10 now proves `h >= 0` without that.
-2. **Section 6.** The fractions use the largest capacity of the whole game, not of the region. Safe, and
-   now stated.
-3. **Section 7.** Revision 1 defined τ as the first load of any package in U. A plan may first pick up a
-   package that already lies at its goal inside U. τ is now the first load of an *undelivered* package in
-   U, and "has to go into X" is defined on undelivered packages. No normal form of the plan is needed.
+1. Revision 1 said that the value of `_crossings` does not increase when a truck is added, and section 7
+   used that. With the limit of 200 crossings the code then had, this was false (`cmax = 2`, weight 201:
+   one truck inside returned 0, two trucks returned 200). It also said that all terms are non-negative.
+2. The fractions use the largest capacity of the whole game, not of the region. Safe, now stated.
+3. Section 7 defined τ as the first load of any package in U. A plan may first pick up a package that
+   already lies at its goal inside U. τ is now the first load of an *undelivered* package in U.
 
-Optional code repair, not applied: in `_crossings`, return `max(a + b, 201)` instead of `a + b` after the
-loop. That makes the returned value monotone and all differences non-negative. It changes nothing unless
-a single road bridge needs more than 200 crossings.
+**Revision 3** (code and text). The code changed in these places, and nowhere else:
+
+1. `_crossings` computes the exact minimum in closed form. No limit, and the cost per call no longer grows
+   with the size of the numbers. On every input the old version handled (answers up to 200) the result is
+   identical, so the 18 given problems expand exactly the same number of states as before.
+2. A ferry that starts at a port it does not serve is part of the map graph (`gports`). Before, `h` could
+   exceed `h*` on such an input (13 against 9 in the test that found it).
+3. A ferry for 0 trucks, or only trucks of capacity 0, no longer divide by zero.
+4. A package that cannot reach its goal no longer crashes the constructor. The search returns no plan.
+5. With more than 10 loaded trucks aboard docked ferries, `_port_cost` uses a weaker bound instead of
+   enumerating all subsets (the enumeration doubles with every truck).
+

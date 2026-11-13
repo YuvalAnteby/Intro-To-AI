@@ -42,12 +42,31 @@ PROFILES = {
     "W": (5, 2, 4, 1),
     "R": (9, 2, 3, 0),      # roads only: bridges, cycles, capacities
     "H": (7, 3, 2, 4),      # many ferries / hubs
+    "T": (4, 2, 2, 1),      # tiny, building block of profile D
     "X": (6, 2, 3, 2),      # inputs outside the assignment's wording: ferry docked at a port it does not
                             # serve, ferry for 0 trucks, truck of capacity 0
 }
 
 
 def random_game(rng, profile):
+    if profile == "D":
+        # two or three independent maps side by side: several parts, for the "one part after the other" rule
+        parts = [random_game(rng, "T") for _ in range(rng.choice([2, 2, 3]))]
+        out = {"Locations": 0, "Roads": set(), "Ports": set(), "Trucks": {}, "Ferries": {}, "Packages": {}}
+        for i, g in enumerate(parts):
+            o = out["Locations"]
+            if i and rng.random() < .2:
+                g["Packages"] = {}                  # a part with trucks and nothing to do
+            out["Roads"] |= {(a + o, b + o) for a, b in g["Roads"]}
+            out["Ports"] |= {a + o for a in g["Ports"]}
+            for k, (l, c) in g["Trucks"].items():
+                out["Trucks"][k + 1000 * i] = (l + o, c)
+            for k, (l, L, c) in g["Ferries"].items():
+                out["Ferries"][k + 1000 * i] = (l + o, tuple(a + o for a in L), c)
+            for k, (a, w, b) in g["Packages"].items():
+                out["Packages"][k + 1000 * i] = (a + o, w, b + o)
+            out["Locations"] += g["Locations"]
+        return out
     nmax, Tmax, Pmax, Fmax = PROFILES[profile]
     n = rng.randint(2, nmax)
     n_isl = rng.randint(1, min(n, 4)) if Fmax else rng.choice([1, 1, 1, 2])
@@ -168,6 +187,46 @@ class Ref:
         self.goal = [game["Packages"][p][2] for p in self.pids]
         self.init = tuple([game["Trucks"][t][0] for t in self.tids] + [game["Ferries"][f][0] for f in self.fids]
                           + [game["Packages"][p][0] for p in self.pids])
+        self._parts(game)
+
+    def _parts(self, game):
+        """Connected parts of the map (roads, ferry routes, start docks), computed here, not taken from ex1."""
+        n = self.n
+        g = list(range(n + self.F))
+
+        def find(x):
+            while g[x] != x:
+                g[x] = g[g[x]]
+                x = g[x]
+            return x
+        for a in range(n):
+            for b in self.adj[a]:
+                g[find(a)] = find(b)
+        for f in range(self.F):
+            for a in list(self.served[f]) + [self.init[self.T + f]]:
+                g[find(a)] = find(n + f)
+        self.tpart = [find(self.init[t]) for t in range(self.T)]
+        self.fpart = [find(n + f) for f in range(self.F)]
+        self.ppart = [find(self.goal[p]) for p in range(self.P)]
+
+    def expected(self, before, after):
+        """The only deviation ex1 may show from the rules: when an action delivers the last package of a
+        part of the map, the trucks and ferries of exactly that part are written back to their start
+        positions. Returns the tuple ex1 must produce for a step before -> after."""
+        o = self.T + self.F
+        open_before = set(self.ppart[p] for p in range(self.P) if before[o + p] != self.goal[p])
+        open_after = set(self.ppart[p] for p in range(self.P) if after[o + p] != self.goal[p])
+        done = open_before - open_after
+        if not done:
+            return after
+        out = list(after)
+        for t in range(self.T):
+            if self.tpart[t] in done:
+                out[t] = self.init[t]
+        for f in range(self.F):
+            if self.fpart[f] in done:
+                out[self.T + f] = self.init[self.T + f]
+        return tuple(out)
 
     def is_goal(self, s):
         o = self.T + self.F
@@ -366,12 +425,8 @@ def check_game(game, deep=True):
                 fails.append("B: illegal action %s in state %r" % (a, st.s))
                 continue
             nw = to_world(pr, ns.s)
-            if nw != want:
-                # allowed only for the documented reset of a finished independent component: the packages
-                # must be where the rules put them
-                o = pr.T + pr.F
-                if not (pr.multi and nw[o:] == want[o:]):
-                    fails.append("B: %s from %r gives %r, rules give %r" % (a, st.s, nw, want))
+            if nw != want and not (pr.multi and nw == ref.expected(w, want)):
+                fails.append("B: %s from %r gives %r, rules give %r" % (a, st.s, nw, want))
             if ns.s not in seen:
                 seen.add(ns.s)
                 q.append(ns)

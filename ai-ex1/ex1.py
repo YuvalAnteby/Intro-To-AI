@@ -1,3 +1,20 @@
+# Use of AI 
+#
+# LLMs used: Claude Fable 5.2 and Astra 6.
+#
+# Claude Fable 5.2:
+#   - Wrote the code in this file: the state representation, successor, goal_test and h_astar.
+#   - Helped improving the heuristic and the successor pruning rules so that the given problems are
+#     solved within the time limit (the optimisations).
+#   - Wrote the mathematical arguments that the heuristic is admissible and that the pruning rules and the
+#     merging of symmetric states keep an optimal plan, and the test tools used to check them against an
+#     independent exhaustive solver.
+#
+# Astra:
+#   - reviewed those proofs and the test tools, and pointed out errors that were then corrected.
+#
+# No other online sources were used.
+
 import ex1_check
 import search
 import utils
@@ -5,7 +22,7 @@ import utils
 from itertools import accumulate
 from operator import itemgetter, sub
 
-id = ["No numbers - I'm special!"]
+id = ["212152896"]
 
 # Pruning switches. All of them are True in the submitted version; they exist so that every rule
 # could be validated separately against an exhaustive search on small random problems.

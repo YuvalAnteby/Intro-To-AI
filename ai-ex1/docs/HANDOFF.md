@@ -233,6 +233,6 @@ Sections 1 to 8 describe the version before this date. What changed in `ex1.py`:
 * No crash when a package cannot reach its goal. The search returns no plan.
 * `_port_cost` no longer enumerates subsets when more than 10 loaded trucks are aboard docked ferries.
 
-New files: `ADMISSIBILITY_PROOF.md` (proof for the heuristic, revision 3) and `validation/` (the test tools,
+New files: `docs/ADMISSIBILITY_PROOF.md` (proof for the heuristic, revision 3) and `util/` (the test tools,
 see its README). The tool names in section 3 refer to an earlier session and are not in this folder.
-Risk 7.1 is now covered by the proof and by `validation/`. Risk 7.2 (time on y3, y4, y7) is unchanged.
+Risk 7.1 is now covered by the proof and by `util/`. Risk 7.2 (time on y3, y4, y7) is unchanged.

@@ -288,7 +288,7 @@ rule above describes. ∎ Theorem P.
 
 ## 8. Targeted tests (support for the lemmas, with an independent exact solver)
 
-`validation/prune_check.py`. For each small random game the true optimum C* comes from the independent
+`util/prune_check.py`. For each small random game the true optimum C* comes from the independent
 implementation of the rules (`Ref`). Then, for a configuration of the switches, the *whole* pruned graph
 is enumerated on raw tuples, without the heuristic, and V is computed for every state. Checked:
 
@@ -305,7 +305,7 @@ are added to focus one at a time), and all rules but one.
 **Correction after review.** The first version of P3 accepted *any* difference in truck or ferry
 positions as soon as the map had several parts, so it did not verify effects there. An external reviewer
 showed this by injecting a wrong DRIVE effect that went unnoticed. P3 is now exact as described above, and
-the same loose test in `validate.py` was fixed. `validation/mutate.py` injects that fault: it is caught in
+the same loose test in `validate.py` was fixed. `util/mutate.py` injects that fault: it is caught in
 every game where a DRIVE is generated (155 of 155 with one part, 53 of 53 with several parts).
 
 The review also exposed a coverage gap: the random profiles almost never produced a map with several

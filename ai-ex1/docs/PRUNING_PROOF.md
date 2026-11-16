@@ -1,10 +1,9 @@
 # Optimality proof for the search in `ex1.py`: pruning, state merging, and their combination with the heuristic
 
-Written against `ex1.py` with md5 `d6c0f6642e7aa52eec9995d0a083b470`. The code was not changed for this
-proof. Companion of `ADMISSIBILITY_PROOF.md` (cited as [H]), which proves `h <= h*`.
+Written against `ex1.py` with md5 `6961c1fc5e9aee03ae67c387160edd5a`. Updated for the additional normal forms in section 10. Companion of `ADMISSIBILITY_PROOF.md` (cited as [H]), which proves `h <= h*`.
 
-Status in one line: every rule now has an argument, the arguments are combined by a staged construction,
-and no rule had to be weakened. Section 9 lists what rests on tests and not on proof.
+Status in one line: the original staged construction is extended by section 10. Section 9 lists the
+pre-existing caveats; section 10 documents the current additional rules.
 
 ## 0. The claim
 
@@ -29,14 +28,17 @@ cost of a sequence of world-legal actions from the start to a goal. A *plan* is 
 | R2 | forced: if a standing truck holds a package whose goal is its location, its only action is to unload the lowest-numbered such package | `forced` in `_truck_standing` |
 | R3 | twins: of several identical objects in the same situation only the lowest-numbered acts. (a) packages of one class in one truck, for UNLOAD, (b) packages of one class lying at one place, for LOAD, (c) empty trucks with the same capacity and the same position code, when no focus is set, (d) empty ferries of one class at one port, for BOARD, (e) the same, for SAIL | `seen`, `seen_t`, `seen_f` |
 | R4 | order: directly after a LOAD the truck does not UNLOAD (except R2) | `kind != 2` |
-| R5 | focus: after a DRIVE or LOAD of truck t the next action is by t | `kind` 1, 2 |
+| R5 | focus: after a DRIVE or LOAD of truck t the next action is by t, optionally preceded by an empty sail for boarding (section 10.3) | `kind` 1, 2 |
 | R6 | no U-turn directly after a DRIVE | `back` |
 | R7 | fresh: no DISEMBARK before the ferry has sailed since the BOARD | odd / even truck code |
 | R8 | barren: an empty truck does not cross a road bridge to a side with no lying undelivered package and no docked usable ferry | `adj_far`, `useful` |
 | R9 | dead: no DRIVE into `dead_drive`, no SAIL to `dead_sail` (bridge sides without marks, dominated ports), no use of `dead_ferry` | `adj_go`, `sail_to`, `fdead` |
 | R10 | parts: only the objects of the lowest-ranked part of the map that still has an undelivered package act. When that part is finished its trucks and ferries are written back to their start positions (`_finish`) | `multi`, `rank` |
 
-* **G2** (used only in the proof): G1 without R3, and with R2 relaxed to "its only action is to unload
+Additional current rules: global eager goal unloading, endpoint-only corridor transfers, and empty
+sails immediately followed by BOARD. Their implementation and proof are in section 10.
+
+* **G2** (used only in the original proof): G1 without R3, and with R2 relaxed to "its only action is to unload
   *some* such package". G1 is a subgraph of G2, and G2 is a subgraph of G0 on the essential state below.
 
 A *class* is: trucks of equal capacity, packages of equal weight and goal, ferries with the same served
@@ -344,3 +346,84 @@ occurred, so no rule was weakened or removed.
 * The proof was written by an LLM. The steps most worth a second reading: stage 2 (the map ρ and the
   ferry that starts at a dead port), stage 4, and the R2 case of Lemma 6.
 * Not covered at all: running time.
+## 10. Additional normal forms (2026-11-16)
+
+This section extends Theorem P and the rule table in section 1. The admissible heuristic remains a
+bound on unrestricted world completions; the rules here only reduce the graph searched for a plan.
+
+### 10.1 Empty road corridors (`OPT_CORRIDOR`)
+
+An anchor is a road vertex of degree other than two, an initial truck position, an initial package
+position, a package goal, or a port in any ferry's `gports`. The interiors of paths between anchors are
+empty degree-two road corridors. `_truck_standing` allows UNLOAD only at anchors. Deliveries are not
+removed, since every goal is an anchor. Initially no package lies inside a corridor, and no UNLOAD can
+put one there, so no interior LOAD is subsequently needed either.
+
+To prove this preserves an optimum, fix any legal plan and one corridor of L unit road edges, numbered
+0 through L. For each threshold j in 1..L, map vertices 0..j-1 to endpoint 0 and vertices j..L to endpoint
+L. Leave the rest of the map fixed. Map every action's locations this way. Replace a DRIVE whose ends
+map to the same endpoint by no action; replace a DRIVE crossing edge j by the L consecutive drives
+along the corridor. LOAD/UNLOAD actions still have their original truck/package and capacities; their
+colocations are preserved. No port, initial position, or goal moves. Expanded drives may pass other
+objects without acting on them, which is legal. Thus each threshold gives a legal plan with all this
+corridor's transfers at endpoints.
+
+If the original plan traverses corridor edge j a total of N_j times, the transformed plan uses L*N_j
+DRIVEs there. The average of these costs over the L thresholds is `sum_j N_j`, exactly the original
+corridor driving cost. Some threshold therefore does not increase cost. Apply this independently to
+all corridors. A cycle attached at only one anchor can be collapsed to that anchor; a component with
+no anchor contains no initial truck or package and need not be visited.
+
+Now apply the previous normalizations. They reorder existing transfers or remove actions; they do not
+create an interior transfer. Thus at least one minimum-cost plan survives the combined rules.
+This is a proof about total driving cost, and does not require equal truck capacities.
+
+### 10.2 Eager goal unloading
+
+With no truck focus active, if any truck can unload a package at its goal, the successor function now
+chooses such an unload globally before other actions. Delivering it now cannot obstruct an action:
+it frees truck capacity, and a package at its goal need never be loaded again. Move this unload ahead
+of the intervening actions in the existing forced-unload argument. Only the active component is used.
+Within a truck focus, `_truck_standing` still offers the forced unload; the focused empty-sail branch
+also permits the additional legal choices discussed in section 10.3. No additional unloading history
+is needed.
+
+### 10.3 Empty sails immediately before boarding (`OPT_LAZYSAIL`)
+
+Take an empty ferry's movements before its next BOARD. There can be no DISEMBARK in this interval.
+Consecutive empty repositionings can be replaced by one sail from the ferry's current port directly to
+that BOARD's port (or no sail if already there): a ferry can sail directly to every served destination.
+If there is no later BOARD, delete those movements. Move the remaining empty sail immediately before
+the BOARD. Intervening actions involve neither the empty ferry nor a truck aboard it, so delaying the
+sail does not invalidate them. Its destination now has a standing truck ready to board.
+
+The implementation retains exactly this form: an empty ferry may sail only to a currently standing
+truck, and the resulting `FE0 + f` state permits only a BOARD on that ferry. Loaded-ferry sailing is
+unchanged. The pending-ferry flag is part of `_canon`, including under ferry renaming; it cannot merge
+with a state that has no pending BOARD.
+
+There is an essential interaction with truck focus. A truck may have just driven to the port or loaded
+there before the ferry arrives. The focused branch therefore allows the empty sail to that truck's
+port, followed by the pending BOARD. For the focus proof, treat the consecutive empty-SAIL/BOARD pair
+as the boarding truck's next operation. Other trucks' DRIVE/LOAD actions commute with it exactly as
+with the original BOARD. This avoids requiring an anticipatory empty sail that this rule removes.
+
+The implementation is intentionally more permissive than the witnessing normal form: the focused
+branch may offer an empty sail despite a goal unload being available, and the pending state may board
+any colocated truck, including one still carrying a goal package. The proof does not require every
+generated plan to unload eagerly. Construct the witness by moving a goal unload before the empty
+sail and BOARD; unloading frees capacity and leaves the truck at the same port, so both remain legal.
+An unrelated truck's intervening DRIVE/LOAD commutes with that unload and can be delayed to its next
+operation by the focus normalization. Then schedule the empty-sail/BOARD pair as above. Thus an eager
+optimal witness remains available. The extra boarding choices are world-legal and cannot remove it
+or produce a cost below the unrestricted world optimum. The old R2 description is subject to this
+permissive pending-boarding exception.
+
+For barren-road pruning, a road-bridge side containing a served destination port also contains that
+ferry's graph node and every port it can currently occupy; otherwise another edge would cross the same
+bridge cut. Its docked port therefore marks that side useful already. Delaying the empty sail does not
+prevent an empty truck from approaching a needed boarding port across a road bridge.
+
+Together, the corridor mapping, eager deliveries, and delayed empty-sail/BOARD pairs can be applied
+before the existing focus/no-op/twin/component normalizations. They preserve at least one optimal plan.
+The pre-existing caveat in section 9 about symmetry for unserved initial ferry ports remains unchanged.

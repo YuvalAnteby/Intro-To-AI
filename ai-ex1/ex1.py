@@ -1,6 +1,6 @@
 # Use of AI 
 #
-# LLMs used: Claude Fable 5.2 and Astra 6.
+# LLMs used: Claude Fable 5.2, Astra 6, and Codex.
 #
 # Claude Fable 5.2:
 #   - Wrote the code in this file: the state representation, successor, goal_test and h_astar.
@@ -12,6 +12,9 @@
 #
 # Astra:
 #   - reviewed those proofs and the test tools, and pointed out errors that were then corrected.
+# Codex:
+#   - Added truck-flow and whole-sail lower bounds, corridor and empty-ferry pruning, and caches.
+#   - Extended the proofs and regression checks and ran the independent validators and benchmarks.
 #
 # No other online sources were used.
 
@@ -38,6 +41,8 @@ OPT_FL = True         # after LOAD the same truck goes on
 OPT_FRESH = True      # a truck that boarded may not disembark before the ferry sails
 OPT_BARREN = True     # an empty truck does not drive into a part where it can neither load nor board
 OPT_FIRST = True      # heuristic: the first truck that enters a part without trucks brings nothing for it
+OPT_CORRIDOR = True   # transfers on empty road corridors can be moved to an endpoint
+OPT_LAZYSAIL = True   # an empty ferry waits until a truck is ready at its destination
 
 
 class _State(object):
@@ -277,9 +282,18 @@ class _Region:
         self.split = _Memo(self._split)
         self.first_in = _Memo(self._first_in)
         self.first_out = _Memo(self._first_out)
+        self.road_extra_cache = {}
         self.TB = 1 << self.TSH
         self.ALLB = ((1 << self.ntrucks) - 1) << self.TSH
         self.rroad = range(self.nroad)
+        self.flow_cost = _Memo(self._flow_cost)
+        self.port_flow_cost = _Memo(self._port_flow_cost)
+        self.flow_cache = {}
+        self.flow_steps = {}
+        self.flow_merges = {}
+        self.flow_zero = (0,) * (self.ntrucks + 1)
+        self.flow_root = root
+        self.flow_order = [(c, parent[c], index[c]) for c in reversed(order) if c != root]
 
         # ---- pieces: groups of locations inside a 2-edge-connected part that are joined by roads.
         # All the transport between a piece (with everything hanging on it) and the rest goes through
@@ -323,6 +337,14 @@ class _Region:
             self.piece_ferries.append([(f2, frozenset(ports)) for f2, ports in served.items()])
             q += 1
         self.npiece = q
+        self.ferry_group = list(range(F))
+        for ferries in self.piece_ferries:
+            groups = {self.ferry_group[f] for f, _ in ferries}
+            first = min(groups)
+            self.ferry_group = [first if g in groups else g for g in self.ferry_group]
+        self.port_site = {x: (self.rmask[x] >> self.nroad) | (self.pmask[x] << (self.ncut - self.nroad))
+                          for x in nodes}
+        self.ferry_cache = {}
         self.pgmask = {p: self.pmask[pr.pgoal[p]] for p in self.pkgs}
         self.NN = n + F + 1
         self.pcross = _Memo(self._piece_crossing)
@@ -467,6 +489,69 @@ class _Region:
         wo, wi, bo, bi, cs, co = self._decode(v)
         return 1 + self._crossings(wo, wi, bo, bi, cs, [self.cmax] + co, 0, 0) - self.g(v, 0, 0)
 
+    def _flow_cost(self, v):
+        """Excess road crossings for each possible number of trucks finishing beyond this bridge."""
+        wo, wi, bo, bi, cs, co = self._decode(v)
+        cm = self.cmax
+        a = max(bo, -(-wo // cm))
+        b = max(bi, -(-wi // cm))
+        costs = []
+        for k in range(self.ntrucks + 1):
+            d = len(cs) - k
+            if d >= 0:
+                z = max(b, a - d, -(-(wo - sum(cs[:d])) // cm))
+                costs.append(2 * z + d)
+            else:
+                d = -d
+                z = max(a, b - d, -(-(wi - sum(co[:d])) // cm))
+                costs.append(2 * z + d)
+        base = min(costs)
+        return tuple(c - base for c in costs)
+
+    def _port_flow_cost(self, key):
+        trucks, out, inn = key
+        return tuple(2 * max(inn, out - (trucks - k)) + trucks - k - out - inn
+                     for k in range(self.ntrucks + 1))
+
+    def _flow(self, cv, pres):
+        """Excess bridge crossings when all cuts agree on the trucks' final locations."""
+        pattern = list(map(self.flow_cost.__getitem__, cv[:self.nroad]))
+        for i in range(self.nroad, self.ncut):
+            boards, disemb = pres.get(i, (0, 0))
+            out, inn = (boards, disemb) if self.cut_port[i][2] else (disemb, boards)
+            pattern.append(self.port_flow_cost[((cv[i] >> self.TSH).bit_count(), out, inn)])
+        pattern = tuple(pattern)
+        result = self.flow_cache.get(pattern)
+        if result is not None:
+            return result
+        dp = [self.flow_zero] * len(self.parent)
+        for c, parent, i in self.flow_order:
+            costs, row = pattern[i], dp[c]
+            key = (costs, row)
+            out = self.flow_steps.get(key)
+            if out is None:
+                out = []
+                best = None
+                for a, b in zip(costs, row):
+                    value = a + b
+                    if best is None or value < best:
+                        best = value
+                    out.append(best)
+                out = self.flow_steps[key] = tuple(out)
+            if dp[parent] is self.flow_zero:
+                dp[parent] = out
+            else:
+                row = dp[parent]
+                key = (row, out)
+                merged = self.flow_merges.get(key)
+                if merged is None:
+                    merged = self.flow_merges[key] = tuple(
+                        min(row[k - j] + out[j] for j in range(k + 1))
+                        for k in range(self.ntrucks + 1))
+                dp[parent] = merged
+        result = self.flow_cache[pattern] = dp[self.flow_root][-1]
+        return result
+
     # ------------------------------------------------------------------ ferries
     def port_cost(self, wo, bo, wi, bi, wn, bn, cargo, ts, ndock, k, here, away):
         """Lower bound on boards + disembarks + sails at a set S of ports (twice the cost, a sail is split
@@ -474,7 +559,7 @@ class _Region:
         wo/wi: weight that has to leave / enter S (bo/bi: big packages); wn/bn: the part of wi that is aboard
         a ferry docked at S; cargo: [weight, big] of every truck aboard a docked ferry whose packages have to
         go elsewhere; ts: trucks in S; ndock: trucks aboard docked ferries; k: largest ferry;
-        here/away: ferries of S docked at S / elsewhere."""
+        here/away: ferries of S docked at S / elsewhere. Also returns the departure-minus-arrival bound."""
         if not cargo:
             key = (wo, bo, wi, bi, wn, bn, ts, ndock, k, here, away)
             r = self.pcm.get(key)
@@ -521,7 +606,7 @@ class _Region:
         a0 = max(-(-mf // k), -(-need // k), 0)
         dep = max(d0, a0 - away)
         arr = max(a0, d0 - here)
-        return 2 * (boards + disemb) + 3 * (dep + arr), boards, disemb
+        return 2 * (boards + disemb) + 3 * (dep + arr), boards, disemb, dep - arr
 
     # ------------------------------------------------------------------ the bound
     def move(self, state, bucket, tnode, tfer):
@@ -533,6 +618,8 @@ class _Region:
         IF = pr.IF
         total2 = 0
         xfer = 0
+        cv = ()
+        flow_extra = 0
         if self.ncut:
             vals = self.zero[:]
             upd = self.upd
@@ -548,116 +635,109 @@ class _Region:
             R = self.nroad
             if R:
                 total2 = 2 * sum(map(self.road0.__getitem__, cv[:R]))
-            pres = None
-            if self.ncut > R:
-                pres = {}
-                WB, BB, WM, BM = self.WB, self.BB, self.WM, self.BM
-                pw = pr.pw
-                pbig = self.pbig
-                for i in range(R, self.ncut):
-                    v = cv[i]
-                    f, a, inside = self.cut_port[i]
-                    docked = state[IF + f] == a
-                    aboard = False
-                    if docked:
-                        for t in self.trucks:
-                            if tfer[t] == f:
-                                aboard = True
-                                break
-                    if not (v & self.WFM) and not aboard:
-                        continue
-                    ts = bin(v >> self.TSH).count("1")
-                    if inside:
-                        wo = v & WM
-                        wi = (v >> WB) & WM
-                        bo = (v >> (2 * WB)) & BM
-                        bi = (v >> (2 * WB + BB)) & BM
-                    else:
-                        wi = v & WM
-                        wo = (v >> WB) & WM
-                        bi = (v >> (2 * WB)) & BM
-                        bo = (v >> (2 * WB + BB)) & BM
-                        ts = self.ntrucks - ts
-                    wn = bn = ndock = 0
-                    cargo = None
-                    if aboard:
-                        lo, hi = self.cut_lo[i], self.cut_hi[i]
-                        per = {}
-                        for t in self.trucks:
-                            if tfer[t] == f:
-                                ndock += 1
-                        for p, site, hol in bucket:
-                            if hol >= 0 and tfer[hol] == f:
-                                gin = (lo < pos1[pr.pgoal[p]] <= hi) == inside
-                                if gin:
-                                    wn += pw[p]
-                                    bn += pbig[p]
-                                else:
-                                    c = per.get(hol)
-                                    if c is None:
-                                        per[hol] = [pw[p], pbig[p]]
-                                    else:
-                                        c[0] += pw[p]
-                                        c[1] += pbig[p]
-                        if per:
-                            cargo = list(per.values())
-                    c2, boards, disemb = self.port_cost(wo, bo, wi, bi, wn, bn, cargo, ts, ndock, max(pr.fk[f], 1),
-                                                        1 if docked else 0, 0 if docked else 1)
-                    total2 += c2
-                    if c2:
-                        pres[i] = (boards, disemb)
-            used = 0
-            if self.merge_goals:
-                xfer, used = self.merge(bucket, cv, pres or {})
-            if R and OPT_FIRST and self.ntrucks:
-                # Sides of road bridges that need transport and have no truck inside (U = all of them).
-                # Until the first LOAD inside U the trucks carry only packages that are outside U now.
-                # The truck that makes this first LOAD has entered every such side around the package it
-                # loads. If no package outside U has its goal in a side, each of these crossings into it
-                # (or an earlier one over the same bridge) brought nothing in: it comes on top of the
-                # crossings that are needed afterwards, when one more truck is inside.
-                TB = self.TB
-                ALLB = self.ALLB
-                WFM = self.WFM
-                cand = [i for i in self.rroad if (cv[i] < TB or cv[i] >= ALLB) and cv[i] & WFM]
-                if cand:
-                    cs = cc = 0
-                    for i in cand:
-                        if not (used >> i) & 1:
-                            if cv[i] < TB:
-                                cs |= 1 << i
-                            else:
-                                cc |= 1 << i
-                    if cs or cc:
-                        rmask = self.rmask
-                        pgoal = pr.pgoal
-                        # sides that get something from a package that is outside U now: no claim there
-                        inside = []
-                        for p, site, hol in bucket:
-                            m = rmask[site]
-                            if (m & cs) or (~m & cc):
-                                inside.append(m)
-                            else:
-                                m = rmask[pgoal[p]]
-                                cs &= ~m
-                                cc &= m
-                        best = None
-                        if cs or cc:
-                            for m in inside:
-                                ins = m & cs
-                                outs = ~m & cc
-                                v = 0
-                                if ins:
-                                    v = sum(map(self.first_in.__getitem__, map(cv.__getitem__, self.split[ins][0])))
-                                if outs:
-                                    v += sum(map(self.first_out.__getitem__, map(cv.__getitem__, self.split[outs][0])))
-                                if best is None or v < best:
-                                    best = v
-                                    if not v:
-                                        break
-                        if best:
-                            total2 += 2 * best
+        if pr.F:
+            port2, pres, piece2, sail_extra2 = self._ferry_bound(state, bucket, tnode, tfer, cv)
+            total2 += port2
+        else:
+            pres, piece2, sail_extra2 = {}, 0, 0
+        if self.ncut:
+            flow_extra = self._flow(cv, pres)
+            xfer = self._road_extra(bucket, cv, pres)
 
+        if pr.has_frac:
+            psi_r = 0
+            psi_a = 0
+            wr = pr.wd_road
+            wa = pr.wd_all
+            ab = pr.abnode
+            for p, site, hol in bucket:
+                if site >= n:
+                    f = site - n
+                    site = ab[f][state[IF + f]]
+                psi_r += wr[p][site]
+                psi_a += wa[p][site]
+            den = pr.den
+            alt_a = piece2 - (-(2 * psi_r) // den) + sail_extra2
+            alt_b = -(-(2 * psi_a) // den)
+            total2 += alt_a if alt_a > alt_b else alt_b
+        else:
+            total2 += piece2 + sail_extra2
+        return (total2 + 1) // 2 + max(xfer, flow_extra)
+
+    def _ferry_bound(self, state, bucket, tnode, tfer, cv):
+        """Port and piece costs depend on island membership, not on drives within an island."""
+        pr = self.pr
+        n, IF = pr.n, pr.IF
+        pos1 = self.pos1
+        site_key = self.port_site
+        key = (tuple(site_key[tnode[t]] for t in self.trucks),
+               tuple(tfer[t] for t in self.trucks), state[IF:pr.IP],
+               tuple((p, site_key[site], hol if site >= n else -1) for p, site, hol in bucket))
+        cached = self.ferry_cache.get(key)
+        if cached is not None:
+            return cached
+        R = self.nroad
+        total2 = 0
+        balance = [0] * pr.F
+        pres = None
+        if self.ncut > R:
+            pres = {}
+            WB, BB, WM, BM = self.WB, self.BB, self.WM, self.BM
+            pw = pr.pw
+            pbig = self.pbig
+            for i in range(R, self.ncut):
+                v = cv[i]
+                f, a, inside = self.cut_port[i]
+                docked = state[IF + f] == a
+                aboard = False
+                if docked:
+                    for t in self.trucks:
+                        if tfer[t] == f:
+                            aboard = True
+                            break
+                if not (v & self.WFM) and not aboard:
+                    continue
+                ts = (v >> self.TSH).bit_count()
+                if inside:
+                    wo = v & WM
+                    wi = (v >> WB) & WM
+                    bo = (v >> (2 * WB)) & BM
+                    bi = (v >> (2 * WB + BB)) & BM
+                else:
+                    wi = v & WM
+                    wo = (v >> WB) & WM
+                    bi = (v >> (2 * WB)) & BM
+                    bo = (v >> (2 * WB + BB)) & BM
+                    ts = self.ntrucks - ts
+                wn = bn = ndock = 0
+                cargo = None
+                if aboard:
+                    lo, hi = self.cut_lo[i], self.cut_hi[i]
+                    per = {}
+                    for t in self.trucks:
+                        if tfer[t] == f:
+                            ndock += 1
+                    for p, site, hol in bucket:
+                        if hol >= 0 and tfer[hol] == f:
+                            gin = (lo < pos1[pr.pgoal[p]] <= hi) == inside
+                            if gin:
+                                wn += pw[p]
+                                bn += pbig[p]
+                            else:
+                                c = per.get(hol)
+                                if c is None:
+                                    per[hol] = [pw[p], pbig[p]]
+                                else:
+                                    c[0] += pw[p]
+                                    c[1] += pbig[p]
+                    if per:
+                        cargo = list(per.values())
+                c2, boards, disemb, diff = self.port_cost(wo, bo, wi, bi, wn, bn, cargo, ts, ndock, max(pr.fk[f], 1),
+                                                          1 if docked else 0, 0 if docked else 1)
+                balance[self.ferry_group[f]] += diff
+                total2 += c2
+                if c2:
+                    pres[i] = (boards, disemb)
         piece2 = 0
         Q = self.npiece
         if Q:
@@ -736,27 +816,75 @@ class _Region:
                     cg = None
                     if cargo:
                         cg = [c for (q2, _), c in cargo.items() if q2 == q]
-                    piece2 += self.port_cost(Wo[q], Bo[q], Wi[q], Bi[q], Wn[q], Bn[q], cg, ts[q], nd[q],
-                                             self.piece_k[q], here, away)[0]
-        if pr.has_frac:
-            psi_r = 0
-            psi_a = 0
-            wr = pr.wd_road
-            wa = pr.wd_all
-            ab = pr.abnode
-            for p, site, hol in bucket:
-                if site >= n:
-                    f = site - n
-                    site = ab[f][state[IF + f]]
-                psi_r += wr[p][site]
-                psi_a += wa[p][site]
-            den = pr.den
-            alt_a = piece2 - (-(2 * psi_r) // den)
-            alt_b = -(-(2 * psi_a) // den)
-            total2 += alt_a if alt_a > alt_b else alt_b
-        else:
-            total2 += piece2
-        return (total2 + 1) // 2 + xfer
+                    cost = self.port_cost(Wo[q], Bo[q], Wi[q], Bi[q], Wn[q], Bn[q], cg, ts[q], nd[q],
+                                          self.piece_k[q], here, away)
+                    piece2 += cost[0]
+                    balance[self.ferry_group[self.piece_ferries[q][0][0]]] += cost[3]
+        sail_extra2 = 3 * sum(map(abs, balance))
+        result = (total2, pres or {}, piece2, sail_extra2)
+        self.ferry_cache[key] = result
+        return result
+
+    def _road_extra(self, bucket, cv, pres):
+        key = (tuple(cv), tuple(bucket), tuple(pres.items()))
+        result = self.road_extra_cache.get(key)
+        if result is not None:
+            return result
+        pr = self.pr
+        R = self.nroad
+        xfer = 0
+        used = 0
+        if self.merge_goals:
+            xfer, used = self.merge(bucket, cv, pres or {})
+        if R and OPT_FIRST and self.ntrucks:
+            # Sides of road bridges that need transport and have no truck inside (U = all of them).
+            # Until the first LOAD inside U the trucks carry only packages that are outside U now.
+            # The truck that makes this first LOAD has entered every such side around the package it
+            # loads. If no package outside U has its goal in a side, each of these crossings into it
+            # (or an earlier one over the same bridge) brought nothing in: it comes on top of the
+            # crossings that are needed afterwards, when one more truck is inside.
+            TB = self.TB
+            ALLB = self.ALLB
+            WFM = self.WFM
+            cand = [i for i in self.rroad if (cv[i] < TB or cv[i] >= ALLB) and cv[i] & WFM]
+            if cand:
+                cs = cc = 0
+                for i in cand:
+                    if not (used >> i) & 1:
+                        if cv[i] < TB:
+                            cs |= 1 << i
+                        else:
+                            cc |= 1 << i
+                if cs or cc:
+                    rmask = self.rmask
+                    pgoal = pr.pgoal
+                    # sides that get something from a package that is outside U now: no claim there
+                    inside = []
+                    for p, site, hol in bucket:
+                        m = rmask[site]
+                        if (m & cs) or (~m & cc):
+                            inside.append(m)
+                        else:
+                            m = rmask[pgoal[p]]
+                            cs &= ~m
+                            cc &= m
+                    best = None
+                    if cs or cc:
+                        for m in inside:
+                            ins = m & cs
+                            outs = ~m & cc
+                            v = 0
+                            if ins:
+                                v = sum(map(self.first_in.__getitem__, map(cv.__getitem__, self.split[ins][0])))
+                            if outs:
+                                v += sum(map(self.first_out.__getitem__, map(cv.__getitem__, self.split[outs][0])))
+                            if best is None or v < best:
+                                best = v
+                                if not v:
+                                    break
+                    xfer += best or 0
+        self.road_extra_cache[key] = xfer
+        return xfer
 
     def merge(self, bucket, cv, pres):
         """Packages with the same goal that are now in different places (groups) share the last part of
@@ -960,7 +1088,8 @@ class LogisticsProblem(search.Problem):
         # focus codes
         self.FD0 = 1                        # truck t has just driven here from u
         self.FL0 = self.FD0 + T * n         # truck t has just loaded package p
-        size = self.FL0 + T * P
+        self.FE0 = self.FL0 + T * P        # empty ferry f has arrived for its next boarding
+        size = self.FE0 + F
         fkind = [0] * size
         fa = [0] * size
         fb = [0] * size
@@ -972,12 +1101,20 @@ class LogisticsProblem(search.Problem):
                 c = self.FL0 + t * P + p
                 fkind[c], fa[c], fb[c] = 2, t, p
         self.fkind, self.fa, self.fb = fkind, fa, fb
+        for f in range(F):
+            fkind[self.FE0 + f], fa[self.FE0 + f] = 3, f
 
         state = [0]
         state += [game["Trucks"][t][0] for t in tids]
         state += [game["Ferries"][f][0] for f in fids]
         state += [game["Packages"][p][0] for p in pids]
         self.s0 = tuple(state)
+        self.transfer_sites = {l for l in range(n) if len(self.adj[l]) != 2}
+        self.transfer_sites.update(state[1:1 + T])
+        self.transfer_sites.update(state[self.IP:])
+        self.transfer_sites.update(self.pgoal)
+        for ports in self.gports:
+            self.transfer_sites.update(ports)
         search.Problem.__init__(self, _State(self, self.s0))
         pclasses = {}
         self.pcls = [pclasses.setdefault((self.pw[p], self.pgoal[p]), len(pclasses)) for p in range(P)]
@@ -1071,6 +1208,9 @@ class LogisticsProblem(search.Problem):
             lk = lk * k // a
         cmax = max(max(self.tcap), 1) if self.tcap else 1
         self.den = 2 * cmax * lk
+        lightest = min((w for w in self.pw if w > 0), default=cmax)
+        # A package that cannot share any truck pays a whole truck's movement cost.
+        self.frac_weight = [cmax if w + lightest > cmax else w for w in self.pw]
         bridge_road = set()
         bridge_port = set()
         for reg in self.regions:
@@ -1124,7 +1264,7 @@ class LogisticsProblem(search.Problem):
                                     dist[y] = d + c
                                     changed = True
                 cache[goal] = dist
-            wd.append([self.pw[p] * x if x < INF else 0 for x in cache[goal]])
+            wd.append([self.frac_weight[p] * x if x < INF else 0 for x in cache[goal]])
         return wd
 
     def _dominated_ports(self, dead_sail):
@@ -1215,7 +1355,7 @@ class LogisticsProblem(search.Problem):
                     self._finish(ns)
                 res.append(("UNLOAD{%d,%d}" % (self.pids[forced], tid), tuple(ns)))
                 return
-            if kind != 2 or not OPT_ORDER:
+            if (kind != 2 or not OPT_ORDER) and (not OPT_CORRIDOR or l in self.transfer_sites):
                 seen = set()
                 for p in cont:
                     if OPT_TWINS:
@@ -1368,9 +1508,9 @@ class LogisticsProblem(search.Problem):
             if aboard is not None and f in aboard:
                 a = aboard[f]
                 a.sort()
-                ferries.append((fcls[f], s[IF + f], tuple(a)))
+                ferries.append((fcls[f], s[IF + f], tuple(a), int(kind == 3 and who == f)))
             else:
-                ferries.append((fcls[f], s[IF + f], ()))
+                ferries.append((fcls[f], s[IF + f], (), int(kind == 3 and who == f)))
         ferries.sort()
         return (tuple(standing), tuple(ferries), tuple(lying))
 
@@ -1382,7 +1522,7 @@ class LogisticsProblem(search.Problem):
         random problems):
 
         1. Never load a package that lies at its goal (unloading it again would only cost more).
-        2. A truck that stands at the goal of a package it carries unloads it before it does anything else.
+        2. Deliver packages at their goals immediately, globally when no truck has focus.
         3. Identical objects in an identical situation (two empty trucks with the same capacity at the same
            place, two packages with the same weight and goal at the same place, two empty ferries of the same
            line at the same port): only the one with the lowest index may be used first.
@@ -1399,7 +1539,9 @@ class LogisticsProblem(search.Problem):
            no truck starts), and never sail to a port with nothing on its island if another port serves
            the same ferries: whatever a plan does there can be done elsewhere for the same cost or less.
         7. States that differ only by a renaming of interchangeable objects are one state (class _State).
-        8. Independent parts of the map are solved one after the other."""
+        8. Independent parts of the map are solved one after the other.
+        9. Move transfers on empty degree-two road corridors to their endpoints.
+        10. An empty ferry sails immediately before a BOARD; this pair may continue truck focus."""
         n = self.n
         T = self.T
         F = self.F
@@ -1411,6 +1553,16 @@ class LogisticsProblem(search.Problem):
         kind = self.fkind[foc]
         res = []
         if self.dead:
+            return res
+        if kind == 3:
+            f = self.fa[foc]
+            if self.fk[f] > 0:
+                for t in range(T):
+                    if state[1 + t] == state[IF + f]:
+                        ns = list(state)
+                        ns[1 + t] = n + 2 * f + (0 if OPT_FRESH else 1)
+                        ns[0] = 0
+                        res.append(("BOARD{%d,%d}" % (self.tids[t], self.fids[f]), tuple(ns)))
             return res
 
         inside = [None] * T
@@ -1451,12 +1603,36 @@ class LogisticsProblem(search.Problem):
                 useful |= 1 << state[IF + f]
         self._useful = useful
 
+        standing = set()
+        aboard_count = [0] * F
+        for tc in state[1:1 + T]:
+            if tc < n:
+                standing.add(tc)
+            else:
+                aboard_count[(tc - n) >> 1] += 1
+
         if kind == 1 or kind == 2:
             t = self.fa[foc]
             self._truck_standing(state, t, state[1 + t], kind, self.fb[foc], inside[t], lying, res)
+            if OPT_LAZYSAIL:
+                loc = state[1 + t]
+                for f in range(F):
+                    port = state[IF + f]
+                    if self.fk[f] > 0 and not aboard_count[f] and port != loc and loc in self.sail_to[f]:
+                        action, ns = self._sail(state, f, port, loc)
+                        ns = list(ns)
+                        ns[0] = self.FE0 + f
+                        res.append((action, tuple(ns)))
             return res
         tcap = self.tcap
         trank = self.trank
+        if OPT_FORCED:
+            for t, cargo in enumerate(inside):
+                if cargo and (not multi or trank[t] == rank):
+                    loc = state[1 + t]
+                    if loc < n and any(pgoal[p] == loc for p in cargo):
+                        self._truck_standing(state, t, loc, 0, -1, cargo, lying, res)
+                        return res
         seen_t = set()
         for t in range(T):
             if multi and trank[t] != rank:
@@ -1484,21 +1660,20 @@ class LogisticsProblem(search.Problem):
                     continue
                 port = state[IF + f]
                 if OPT_TWINS:
-                    code0 = n + 2 * f
-                    empty = True
-                    for t in range(1, 1 + T):
-                        c = state[t]
-                        if c == code0 or c == code0 + 1:
-                            empty = False
-                            break
+                    empty = not aboard_count[f]
                     if empty:
                         key = (port, self.fcls[f])
                         if key in seen_f:
                             continue
                         seen_f.add(key)
                 for b in self.sail_to[f]:
-                    if b != port:
-                        res.append(self._sail(state, f, port, b))
+                    if b != port and (not OPT_LAZYSAIL or aboard_count[f] or b in standing):
+                        action, ns = self._sail(state, f, port, b)
+                        if OPT_LAZYSAIL and not aboard_count[f]:
+                            ns = list(ns)
+                            ns[0] = self.FE0 + f
+                            ns = tuple(ns)
+                        res.append((action, ns))
         return res
 
     def goal_test(self, state):
@@ -1568,7 +1743,15 @@ class LogisticsProblem(search.Problem):
                     h += 1
                     bucket.append((p, tnode[c - n], c - n))
             if bucket:
-                h += self.regions[0].move(state, bucket, tnode, tfer)
+                reg = self.regions[0]
+                # Custody affects movement only for merging groups or cargo aboard a ferry.
+                key = (tuple(tnode), state[self.IF:IP],
+                       tuple((p, site, hol if site >= n or pgoal[p] in reg.merge_goals else -1)
+                             for p, site, hol in bucket))
+                value = reg.cache.get(key)
+                if value is None:
+                    value = reg.cache[key] = reg.move(state, bucket, tnode, tfer)
+                h += value
             return h
         buckets = [[] for _ in range(self.ncomp)]
         prank = self.prank

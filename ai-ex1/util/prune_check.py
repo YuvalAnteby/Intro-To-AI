@@ -23,9 +23,9 @@ import ex1
 from validate import Ref, random_game, to_world, INF
 
 ALL = ["OPT_FOCUS", "OPT_TWINS", "OPT_FORCED", "OPT_ORDER", "OPT_COMP", "OPT_SYM", "OPT_DEAD", "OPT_UTURN",
-       "OPT_FL", "OPT_FRESH", "OPT_BARREN"]
+       "OPT_FL", "OPT_FRESH", "OPT_BARREN", "OPT_CORRIDOR", "OPT_LAZYSAIL"]
 CONFIGS = {"all": set(ALL), "none": set()}
-for name, on in [("only TWINS", ["OPT_TWINS"]), ("only FORCED", ["OPT_FORCED"]), ("only DEAD", ["OPT_DEAD"]),
+for name, on in [("only LAZYSAIL", ["OPT_LAZYSAIL"]), ("only CORRIDOR", ["OPT_CORRIDOR"]), ("only TWINS", ["OPT_TWINS"]), ("only FORCED", ["OPT_FORCED"]), ("only DEAD", ["OPT_DEAD"]),
                  ("only COMP", ["OPT_COMP"]), ("only SYM", ["OPT_SYM"]), ("only FOCUS(drive)", ["OPT_FOCUS"]),
                  ("FOCUS+FL", ["OPT_FOCUS", "OPT_FL"]), ("FOCUS+FL+ORDER", ["OPT_FOCUS", "OPT_FL", "OPT_ORDER"]),
                  ("FOCUS+UTURN", ["OPT_FOCUS", "OPT_UTURN"]), ("FOCUS+FRESH", ["OPT_FOCUS", "OPT_FRESH"]),

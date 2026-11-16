@@ -1,11 +1,10 @@
 # Admissibility proof for `h_astar` in `ex1.py`
 
-Written against `ex1.py` with md5 `d6c0f6642e7aa52eec9995d0a083b470`.
+Written against `ex1.py` with md5 `6961c1fc5e9aee03ae67c387160edd5a`.
 If the heuristic code changes, the matching section here has to be rechecked.
 
-Revision 3 (2026-11-13). Revision 2 corrected three inaccuracies found by an external review. Revision 3
-follows a change of the code: the fixed limit of 200 crossings is gone, and inputs that the assignment's
-wording does not strictly exclude are handled. Section 12 lists everything.
+Revision 4 (2026-11-16). Section 13 proves the new bounds and cache keys, and supersedes the older
+assembly formula in section 2. Sections 1–12 retain the supporting lemmas and revision history.
 
 ## 0. The claim
 
@@ -463,3 +462,108 @@ problems, and equal to the cost found with all pruning off on 390 larger games) 
 5. With more than 10 loaded trucks aboard docked ferries, `_port_cost` uses a weaker bound instead of
    enumerating all subsets (the enumeration doubles with every truck).
 
+## 13. Revision 4: stronger bounds and cached evaluation (2026-11-16)
+
+The implementation now uses the formula below; this supersedes the assembly formula in section 2.
+The original lemmas about road cuts, port cuts, pieces, first entry and merging still apply.
+
+```
+B2 = 2 * sum(road bounds) + sum(port-bridge bounds)
+N2 = max(piece bounds + ceil(2 * road fractions) + sail_balance,
+         ceil(2 * all fractions))
+h = base + sum_regions [ceil((B2 + N2) / 2)
+                        + max(merge + first_entry, truck_flow_excess)]
+```
+
+When there are no fractional edges, `N2 = piece bounds + sail_balance`.
+`_road_extra` returns `merge + first_entry`; it is the old calculation moved into a cached function.
+The new terms are proved below. None depends on path cost, search order, or the pruning history.
+
+### 13.1 Packages that cannot share a truck
+
+Let C be the largest truck capacity, bounded below by 1 as before, and m the smallest strictly positive
+package weight in the input. Define the fractional weight of p as C when `w_p + m > C`, and as `w_p`
+otherwise. A package whose fractional weight is increased cannot be in a legal truck with any other
+positive-weight package: their actual combined weight would exceed C. Zero-weight packages retain
+fractional weight zero. Consequently every legal truck load has total fractional weight at most C.
+For inputs with no positive-weight packages there is nothing to increase in any legal load.
+
+Replace `w_p` by this fractional weight in Lemma 3. Its action-charging proof is unchanged: no truck
+pays more than one unit per DRIVE/BOARD/DISEMBARK, and no ferry pays more than its allotted half-sail.
+This strengthens both distance tables without increasing their evaluation cost.
+
+### 13.2 Whole sails, shared across port bounds
+
+`_port_cost` still returns the old doubled cost and the lower bounds on BOARDs and DISEMBARKs. It also
+returns `dep - arr`, using the departure and arrival lower bounds already proved in Lemma 2.
+
+Partition ferries into groups by joining any two that occur together in a piece's port set. Every port
+bridge belongs to one group, and every piece belongs to one group. In a fixed group, sum all departure
+bounds to D and all arrival bounds to A. The counted port sets are disjoint, so each actual sail in this
+group contributes to at most one counted departure and at most one counted arrival. If S is the total
+number of its sails, `S >= D` and `S >= A`. Thus their cost is at least `3 * max(D, A)`.
+
+The old terms charge `1.5 * (D + A)`. Adding `1.5 * abs(D - A)` replaces that with the stronger bound.
+In doubled units this is `3 * abs(D - A)`, summed over the disjoint ferry groups. This correction belongs
+only to the `pieces + road fractions` alternative. It is deliberately omitted from the `all fractions`
+alternative, which also claims non-bridge half-sails. BOARD/DISEMBARK and road costs remain disjoint
+from this sailing bound, including all excess crossings claimed by merging or truck flow.
+
+### 13.3 All bridge cuts must agree on the trucks' final positions
+
+Contract G into its tree of bridge components as in section 4. In a fixed real completion, let k_c be
+the number of trucks finally in the subtree of component c, and t_c the number there now. Across the
+edge to c, conservation gives `out - in = t_c - k_c`. These counts must describe one common final
+placement of the region's T trucks; independently minimizing every cut need not give such a placement.
+
+For a road bridge, fix k and put `d = |cs| - k`. For `d >= 0`, the proof of Lemma 1 gives
+
+```
+in >= max(ceil(wi/C), bi, ceil(wo/C) - d, bo - d,
+          ceil((wo - sum(d largest capacities in cs)) / C))
+out = in + d.
+```
+
+This is exactly the positive-d branch of `_flow_cost`; the negative-d branch is the mirror image.
+Subtract the old minimum `g(v, 0, 0)` from each conditional cost. The resulting vector is non-negative,
+and its entry k bounds the excess road crossings of any plan ending with k trucks in that subtree.
+
+For a port bridge, let b and u be the old BOARD and DISEMBARK lower bounds (`pres`, or zero if skipped).
+If the subtree is on the port side, set `out0=b, in0=u`; otherwise reverse them. For fixed
+`d = t_c - k`, the minimum compatible crossing count is
+
+```
+2 * max(in0, out0 - d) + d.
+```
+
+Subtract `out0 + in0`. This is `_port_flow_cost`, a lower bound on excess BOARD/DISEMBARK actions; it
+claims no sails. A skipped cut may safely have zero base demand but still constrains truck conservation.
+
+The tree dynamic program minimizes the sum of these excesses over possible final truck placements.
+Child vectors are combined by `min(row[k-j] + child[j])`; the prefix minimum permits unused trucks to
+finish in the current component. At the root at most T trucks are assigned below it, and all remaining
+trucks may finish at the root. Every real final placement is represented. Allowing arbitrary truck
+identities and free movement inside a contracted component only enlarges the feasible set.
+Therefore `truck_flow_excess` cannot exceed the real excess bridge-crossing cost over the old base.
+
+The flow bound and `merge + first_entry` can claim the same excess movements, so the code takes their
+**maximum**, never their sum. Each can be added to the common base and to either non-bridge alternative.
+This proves the displayed formula admissible. At a goal, the actual zero-action completion supplies a
+zero-cost placement; all non-negative terms are consequently zero.
+
+### 13.4 Cache keys preserve the computed bounds
+
+* Flow is cached by its conditional excess vectors. The tree and T are fixed for the region; all other
+  information has already been consumed in those vectors.
+* `_road_extra` is cached by all cut values, the complete pending-package bucket, and the port crossing
+  bounds. Those are its complete dynamic inputs.
+* `_ferry_bound` records, for each truck and package, its membership in every port-bridge side and every
+  piece, together with ferry positions, truck-to-ferry assignments and aboard-package holders. Road
+  coordinates within those same memberships cannot affect any of its counts. Its key therefore omits
+  them. Membership masks use separate bit ranges for port bridges and pieces.
+* The single-region movement cache omits the holder only for a standing package whose goal is not a
+  merge candidate. In the movement calculation that holder is used neither for ferry cargo nor for
+  grouping a merge; all remaining terms use the package's physical node. Its LOAD/UNLOAD base is still
+  computed separately for the actual state.
+
+These caches change neither the bounds nor admissibility. They use no estimated solution costs.

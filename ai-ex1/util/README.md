@@ -5,12 +5,14 @@ implemented again in `validate.py` (class `Ref`) from the assignment text.
 
 | command | what it checks |
 |---|---|
+| `python3 util/benchmark.py all` | All supplied cases, optimal cost and legal replay, five-second limit including initialization; exits nonzero on failure. |
+| `python3 util/heuristic_check.py` | Focused regressions for fractional cargo, whole sails, truck endpoints, corridor transfers and empty sails after a focused drive. |
 | `python util/validate.py 1000 700 S` | Small random games, whole state space enumerated, exact h*. Plan optimal, every generated action legal, `h <= h*` on every state, `h` a non-negative int, `goal_test` right. Arguments: first seed, number of games, profile. |
 | `python util/validate.py 20000 700 X` | The same on inputs outside the assignment's wording (ferry starting at a port it does not serve, ferry for 0 trucks, truck of capacity 0). |
 | `python util/validate_big.py 9000 250 150000` | Larger games: plan cost against a plain uniform-cost search. |
 | `python util/crosscheck.py 1000 400 G 8 420` | Games too large to enumerate: the submitted configuration against a weaker heuristic and against no pruning. Profiles `G`, `G2`. Uses a timer signal, so Linux or macOS only. |
 | `python util/walk.py x3 40 25 20` | A given problem: `h` against the cost of real plans from random reachable states. |
-| `python util/prune_check.py 50000 300 S` | Pruning and state merging without the heuristic: the whole pruned graph against the exact solver, in 26 configurations of the switches (all rules, each alone, all but one). See [the pruning proof](../docs/PRUNING_PROOF.md), section 8. |
+| `python util/prune_check.py 50000 300 S` | Pruning and state merging without the heuristic: the whole pruned graph against the exact solver, in 30 configurations of the switches (all rules, each alone, all but one). See [the pruning proof](../docs/PRUNING_PROOF.md), section 8. |
 | `python util/mutate.py` | Checks the checker: injects a wrong effect in memory and counts how often `prune_check` notices. |
 | `python util/edge.py` | Hand-written edge cases (empty input, unsolvable input, odd formats). |
 

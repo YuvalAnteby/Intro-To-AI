@@ -1,5 +1,8 @@
 # Assignment 1 (Trucks, Packages, Ferries): handoff notes
 
+**Current update (2026-11-16): all 18 supplied cases pass the five-second target on the local machine.
+See section 10 for measurements, new bounds, and validation. Earlier sections record the old version.**
+
 Written for whoever continues this work (a Claude Code session, or Yuval reading the code).
 It records what the current `ex1.py` does, why each part is believed correct, what was measured,
 what was tried and dropped, and what is still open.
@@ -236,3 +239,56 @@ Sections 1 to 8 describe the version before this date. What changed in `ex1.py`:
 New files: `docs/ADMISSIBILITY_PROOF.md` (proof for the heuristic, revision 3) and `util/` (the test tools,
 see its README). The tool names in section 3 refer to an earlier session and are not in this folder.
 Risk 7.1 is now covered by the proof and by `util/`. Risk 7.2 (time on y3, y4, y7) is unchanged.
+
+## 10. Five-second target (2026-11-16)
+
+Measured with Python 3.14.3 on the local machine, including construction, using the unchanged supplied
+A* framework. `python3 util/benchmark.py all` checks legal replay, the known optimum, and a five-second
+limit for every supplied case; the full run passed all 18. These are measurements, not a hardware-
+independent runtime guarantee.
+
+| Case | Original local time | Updated full-suite time | Expanded | Optimal cost |
+|---|---:|---:|---:|---:|
+| y3 | 10.16 s | 0.151 s | 1,976 | 96 |
+| y4 | 9.01 s | 2.118 s | 37,885 | 71 |
+| y7 | 7.83 s | 4.726 s | 85,245 | 60 |
+
+A separate repeat of the three hard cases passed at 0.151 s, 2.008 s, and 4.560 s respectively,
+with identical expansion counts and optimal costs.
+
+Kept changes:
+
+* A bridge-tree dynamic program makes all cuts agree on final truck counts. Its excess is combined by
+  maximum with merge/first-entry excess, so their overlapping movement costs are not added.
+* Port departure/arrival bounds are balanced into whole sails per disjoint ferry group.
+* Fractional distances charge a full truck to a package that cannot share with another positive-weight
+  package. All of these extensions are proved in `ADMISSIBILITY_PROOF.md`, section 13.
+* Transfers along empty degree-two corridors occur only at endpoints (`OPT_CORRIDOR`). The proof uses
+  the average cost of mapping each corridor to its endpoints, so it works with unequal capacities.
+* Empty ferry repositioning waits until a truck is ready and is immediately followed by BOARD
+  (`OPT_LAZYSAIL`). Focus permits that empty-SAIL/BOARD pair. `FE0 + f` is the new pending-ferry state;
+  `_canon` includes it, while the heuristic continues to ignore history.
+* Goal unloading is globally eager when no truck focus is active. These normal forms are proved in
+  `PRUNING_PROOF.md`, section 10.
+* Road extras, conditional truck-flow costs, and ferry bounds are cached by their actual inputs.
+  Ferry bounds ignore road positions that do not change port-side or piece membership.
+
+The pickup-order subset bound was evaluated and removed: it added evaluation cost without helping y7.
+The production implementation does not contain a problem-name shortcut or a stored solution.
+`search.py`, `utils.py`, and the official checker are unchanged.
+
+Validation of the final algorithm:
+
+* `util/heuristic_check.py`: focused examples for each new bound, corridor transfers, and ferry focus.
+* Exact reference checks: S seeds 77000–77149, X 78000–78099, H 79000–79099: 1,221,538 reachable world
+  states, zero admissibility violations or wrong plans. Fourteen games exceeded the enumeration cap
+  and were skipped; unsolvable games were checked separately by the same validator.
+* Independent-component profile D, seeds 82000–82059: another 465,329 world states, zero failures;
+  17 games exceeded the enumeration cap. Total final world-state checks: 1,686,867.
+* Pruning without the heuristic: S 80000–80099 and R 81000–81059, 128 solvable games in 30 switch
+  configurations, zero failures. Earlier development checks also passed; the counts here do not
+  combine them with final verification.
+* `util/edge.py`: every listed edge case passed, including zero weights and zero ferry capacity.
+
+The pre-existing symmetry-proof caveat for ferries initially outside their served ports remains in
+section 9 of the pruning proof. Hidden grader cases have not been supplied.

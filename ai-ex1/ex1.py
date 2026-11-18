@@ -1209,8 +1209,9 @@ class LogisticsProblem(search.Problem):
         cmax = max(max(self.tcap), 1) if self.tcap else 1
         self.den = 2 * cmax * lk
         lightest = min((w for w in self.pw if w > 0), default=cmax)
-        # A package that cannot share any truck pays a whole truck's movement cost.
-        self.frac_weight = [cmax if w + lightest > cmax else w for w in self.pw]
+        # A package that cannot share a truck with any other package of positive weight pays a whole
+        # truck's movement cost. Packages of weight 0 can always share, so they keep weight 0.
+        self.frac_weight = [cmax if (w > 0 and w + lightest > cmax) else w for w in self.pw]
         bridge_road = set()
         bridge_port = set()
         for reg in self.regions:

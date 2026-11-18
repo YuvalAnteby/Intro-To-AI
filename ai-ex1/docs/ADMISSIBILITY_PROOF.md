@@ -1,10 +1,10 @@
 # Admissibility proof for `h_astar` in `ex1.py`
 
-Written against `ex1.py` with md5 `6961c1fc5e9aee03ae67c387160edd5a`.
+Written against `ex1.py` with md5 `ce80d776d4c33c27b1e3aa0bb76617a6`.
 If the heuristic code changes, the matching section here has to be rechecked.
 
-Revision 4 (2026-11-16). Section 13 proves the new bounds and cache keys, and supersedes the older
-assembly formula in section 2. Sections 1–12 retain the supporting lemmas and revision history.
+Revision 5 (2026-11-16). Section 13 proves the new bounds and cache keys, and supersedes the older
+assembly formula in section 2. Revision 5 corrects section 13.1 and the code it describes (see 13.5). Sections 1–12 retain the supporting lemmas and revision history.
 
 ## 0. The claim
 
@@ -24,24 +24,24 @@ code now covers them.
 Fix a state and any plan from it that delivers every package. All counts below ("the number of ...")
 refer to this plan.
 
-**Graph G.** Nodes: every location, and one node per ferry. Edges: a *road edge* per road, and a
-*port edge* `(a, f)` for every port `a` that ferry `f` serves and for the port where `f` starts
-(`gports` in the code, the two coincide when the ferry starts at a port it serves). The *node of a truck* is its location, or
-the ferry it is aboard. The *node of a package* is its location, or the node of the truck that holds it.
+**Graph G.** Nodes: every location, and one node per ferry. Edges: a _road edge_ per road, and a
+_port edge_ `(a, f)` for every port `a` that ferry `f` serves and for the port where `f` starts
+(`gports` in the code, the two coincide when the ferry starts at a port it serves). The _node of a truck_ is its location, or
+the ferry it is aboard. The _node of a package_ is its location, or the node of the truck that holds it.
 
-* **F1.** DRIVE moves a truck along one road edge. BOARD and DISEMBARK of ferry `f` docked at `a` move a
+- **F1.** DRIVE moves a truck along one road edge. BOARD and DISEMBARK of ferry `f` docked at `a` move a
   truck along the port edge `(a, f)` (this edge exists, because a ferry is always docked at its start port or
   at a port it serves). SAIL, LOAD and UNLOAD move no truck and no package in G.
-* **F2.** A package changes node only while it is inside a truck that traverses an edge.
-* **F3.** The weight inside a truck never exceeds its capacity, hence never exceeds `cmax`, the largest
+- **F2.** A package changes node only while it is inside a truck that traverses an edge.
+- **F3.** The weight inside a truck never exceeds its capacity, hence never exceeds `cmax`, the largest
   capacity among the trucks of the region (section 6 uses the largest capacity of the whole game instead,
-  see there). A package is *big* if `2w > cmax`. Two big packages are never
+  see there). A package is _big_ if `2w > cmax`. Two big packages are never
   in one truck at the same time.
-* **F4.** A *bridge* of G is an edge whose removal splits its region (connected component of G) into two
-  *sides*. A truck or package changes side only by traversing the bridge, so the crossings of one truck
+- **F4.** A _bridge_ of G is an edge whose removal splits its region (connected component of G) into two
+  _sides_. A truck or package changes side only by traversing the bridge, so the crossings of one truck
   alternate in direction.
-* **F5.** A SAIL of `f` from `x` to `y` costs 3. Split it into a *departure half* that belongs to the
-  pair `(x, f)` and an *arrival half* that belongs to `(y, f)`, 1.5 each.
+- **F5.** A SAIL of `f` from `x` to `y` costs 3. Split it into a _departure half_ that belongs to the
+  pair `(x, f)` and an _arrival half_ that belongs to `(y, f)`, 1.5 each.
 
 **Additivity principle.** If several sets of actions (or half-sails) are pairwise disjoint and each has a
 lower bound on its cost that holds for every plan, then the sum of the bounds is a lower bound on the
@@ -57,15 +57,15 @@ T2 = 2 * sum(road bridges) + sum(port bridges) + 2 * first_entry + max(pieces + 
 
 `T2` is in doubled units (a DRIVE is 2, a half-sail is 3) so that everything stays an integer.
 
-| term | code | actions it claims | proved in |
-|---|---|---|---|
-| base | `_bound` | one LOAD + one UNLOAD per lying undelivered package, one UNLOAD per package inside a truck | 3 |
-| road bridge `e` | `g`, `_crossings` | DRIVEs over `e` | 4 |
-| port bridge `(a,f)` | `port_cost` | BOARD / DISEMBARK of `f` at `a`, half-sails of the pair `(a,f)` | 5 |
-| piece `q` | `port_cost` in `move` | BOARD / DISEMBARK over the non-bridge port edges of `q`, half-sails of those pairs | 5 |
-| fractions | `wd_road`, `wd_all` | DRIVEs over non-bridge roads (and, in the second alternative, the same actions as the pieces) | 6 |
-| first entry | `first_in`, `first_out` | DRIVEs over road bridges, beyond the road-bridge term, only on bridges merge does not use | 7 |
-| merge | `merge`, `_merge_goal` | LOAD / UNLOAD beyond base, and crossings beyond the bridge terms on the bridges it marks `used` | 8 |
+| term                | code                    | actions it claims                                                                               | proved in |
+| ------------------- | ----------------------- | ----------------------------------------------------------------------------------------------- | --------- |
+| base                | `_bound`                | one LOAD + one UNLOAD per lying undelivered package, one UNLOAD per package inside a truck      | 3         |
+| road bridge `e`     | `g`, `_crossings`       | DRIVEs over `e`                                                                                 | 4         |
+| port bridge `(a,f)` | `port_cost`             | BOARD / DISEMBARK of `f` at `a`, half-sails of the pair `(a,f)`                                 | 5         |
+| piece `q`           | `port_cost` in `move`   | BOARD / DISEMBARK over the non-bridge port edges of `q`, half-sails of those pairs              | 5         |
+| fractions           | `wd_road`, `wd_all`     | DRIVEs over non-bridge roads (and, in the second alternative, the same actions as the pieces)   | 6         |
+| first entry         | `first_in`, `first_out` | DRIVEs over road bridges, beyond the road-bridge term, only on bridges merge does not use       | 7         |
+| merge               | `merge`, `_merge_goal`  | LOAD / UNLOAD beyond base, and crossings beyond the bridge terms on the bridges it marks `used` | 8         |
 
 These sets are pairwise disjoint: different edges are different actions, bridge and non-bridge edges are
 different edges, half-sails are indexed by (port, ferry) pairs that follow the same split, and the three
@@ -81,9 +81,9 @@ These are different actions for different packages, and none is a movement actio
 
 For a road bridge `e` let S be one side ("inside") and let
 
-* `wo`, `bo` = total weight and number of big packages that are inside now with goal outside,
-* `wi`, `bi` = the same for packages outside now with goal inside,
-* `cs` = capacities of the trucks inside now, `co` = of the trucks outside now.
+- `wo`, `bo` = total weight and number of big packages that are inside now with goal outside,
+- `wi`, `bi` = the same for packages outside now with goal inside,
+- `cs` = capacities of the trucks inside now, `co` = of the trucks outside now.
 
 The code obtains these from `cv[i]` (point masses on the bridge tree, prefix sums over the subtree).
 A package inside and going inside contributes `out + inn - out - inn = 0`.
@@ -95,9 +95,9 @@ Then
 2. there is `j <= min(|cs|, zo)` with `zo - j <= zi` and `(sum of the j largest of cs) + (zo - j) * cmax >= wo`,
 3. the mirror statement of 2 for `zi`, `co`, `wi`.
 
-*Proof.* (1) Every big package that has to go out is carried over `e` outward at least once, and by F3
+_Proof._ (1) Every big package that has to go out is carried over `e` outward at least once, and by F3
 one crossing carries at most one big package.
-(2) Call an out-crossing *fresh* if it is the first crossing of `e` by that truck. A fresh out-crossing is
+(2) Call an out-crossing _fresh_ if it is the first crossing of `e` by that truck. A fresh out-crossing is
 made by a truck that is inside now, and each truck makes at most one, so the `j` fresh out-crossings are
 made by `j` different trucks of `cs`. By F4 every other out-crossing is directly preceded, for the same
 truck, by an in-crossing, and different out-crossings get different in-crossings. So `zo - j <= zi`.
@@ -106,16 +106,16 @@ out-crossings add up to at least `wo`. The fresh ones carry at most the `j` larg
 together, every other one at most `cmax`.
 (3) Symmetric. ∎
 
-Call a pair `(zo, zi)` *feasible for* `(cs, co)` if it satisfies 2 and 3 with these truck lists.
+Call a pair `(zo, zi)` _feasible for_ `(cs, co)` if it satisfies 2 and 3 with these truck lists.
 `_crossings(wo, wi, bo, bi, cs, co, a, b)` returns exactly the least `zo + zi` over the feasible pairs with
 `zo >= max(a, bo)` and `zi >= max(b, bi)`, for any size of the numbers. It does so in closed form:
 
-* Take a pair with `zo >= zi` and put `d = zo - zi`. In 2, the constraint `zo - j <= zi` says `j >= d`, and
+- Take a pair with `zo >= zi` and put `d = zo - zi`. In 2, the constraint `zo - j <= zi` says `j >= d`, and
   the left side of the weight inequality does not grow with `j`, because no capacity exceeds `cmax`. So 2
   holds for some `j` exactly when it holds for `j = d`, which needs `d <= |cs|` and
   `(d largest of cs) + zi * cmax >= wo`. Statement 3 holds for some `i` exactly when it holds for `i = 0`,
   that is `zi * cmax >= wi`.
-* So for every `d` in `0..|cs|` the least total is `2 * zi + d` with
+- So for every `d` in `0..|cs|` the least total is `2 * zi + d` with
   `zi = max(b', a' - d, ceil((wo - (d largest of cs)) / cmax))`, where `a' = max(a, bo, ceil(wo/cmax))`
   and `b' = max(b, bi, ceil(wi/cmax))`. The pairs with `zi > zo` are the mirror image.
 
@@ -138,12 +138,12 @@ Different road bridges are different roads, so the bounds add. ∎
 
 `port_cost` is used for two kinds of cuts.
 
-* **Port bridge** `(a, f)`: E = {`(a, f)`}, S = the side that contains `a`.
-* **Piece** `q` (a maximal set of locations joined by non-bridge roads, inside a 2-edge-connected part):
+- **Port bridge** `(a, f)`: E = {`(a, f)`}, S = the side that contains `a`.
+- **Piece** `q` (a maximal set of locations joined by non-bridge roads, inside a 2-edge-connected part):
   E = the non-bridge port edges `(a, f)` with `a` in the piece, S = everything reachable from the piece
   without using E.
 
-*E is exactly the set of edges between S and the rest.* For a port bridge this is the definition. For a
+_E is exactly the set of edges between S and the rest._ For a port bridge this is the definition. For a
 piece: a non-bridge edge has both ends in the same 2-edge-connected part, roads of that kind stay inside
 the piece, and what hangs on the piece through bridges cannot reconnect to the rest. So S is the piece
 plus what hangs on it through bridges, the ferry node of every edge of E lies outside S, and every edge
@@ -152,15 +152,15 @@ that leaves S is in E. The sets E of different pieces are disjoint, and none con
 So a truck leaves S only by a BOARD over an edge of E ("out-crossing") and enters S only by a DISEMBARK
 over an edge of E ("in-crossing"). Write P(f) for the ports `a` with `(a, f)` in E. Inputs of `port_cost`:
 
-* `wo, bo` / `wi, bi`: weight and big packages that are in S with goal outside / outside S with goal in S,
-* `wn, bn`: the part of `wi, bi` that is inside trucks aboard a ferry `f` docked at a port of P(f),
-* `cargo`: for each truck aboard such a docked ferry, the weight and big count of its packages whose goal
+- `wo, bo` / `wi, bi`: weight and big packages that are in S with goal outside / outside S with goal in S,
+- `wn, bn`: the part of `wi, bi` that is inside trucks aboard a ferry `f` docked at a port of P(f),
+- `cargo`: for each truck aboard such a docked ferry, the weight and big count of its packages whose goal
   is outside S,
-* `ts`: trucks in S, `to = ntrucks - ts`, `ndock`: trucks aboard ferries docked at their P ports,
-* `k`: the largest capacity of the ferries of E, but at least 1 (a sail still has at most `k` trucks
+- `ts`: trucks in S, `to = ntrucks - ts`, `ndock`: trucks aboard ferries docked at their P ports,
+- `k`: the largest capacity of the ferries of E, but at least 1 (a sail still has at most `k` trucks
   aboard), `here` / `away`: ferries of E docked at a P port / not.
 
-Let `mo = max(ceil(wo/cmax), bo)` and `mi = max(ceil(wi/cmax), bi)`. An *incidence* is a pair
+Let `mo = max(ceil(wo/cmax), bo)` and `mi = max(ceil(wi/cmax), bi)`. An _incidence_ is a pair
 (sail event, truck aboard during it). A sail has at most `k` incidences.
 Let D and A be the numbers of departures from, and arrivals at, P ports by the ferries of E.
 
@@ -173,15 +173,15 @@ Let D and A be the numbers of departures from, and arrivals at, P ports by the f
 So the cost of the BOARDs, DISEMBARKs and half-sails of E is at least
 `boards + disemb + 1.5 * (max(d0, a0 - away) + max(a0, d0 - here))`, which is half of what the code returns.
 
-*Proof of 1.* Call an out-crossing an *L-event* if it is the last out-crossing of some package that has to
+_Proof of 1._ Call an out-crossing an _L-event_ if it is the last out-crossing of some package that has to
 go out. The packages that share an L-event are in one truck at one moment, so by F3 there are at least
-`mo` L-events. Likewise there are at least `mi` *first-in events* (in-crossings that are the first
+`mo` L-events. Likewise there are at least `mi` _first-in events_ (in-crossings that are the first
 in-crossing of some package that has to go in). A first-in event is either the first crossing of its
 truck (at most `to` events, one per truck that is outside now) or is preceded by an out-crossing of the
 same truck, different events by different out-crossings (F4). So BOARDs `>= mi - to`. Symmetric for
 DISEMBARKs. ∎
 
-*Proof of 2, departures.* (i) Take an L-event: truck `t` boards `f` at `a` in P(f) carrying `p`, and `p`
+_Proof of 2, departures._ (i) Take an L-event: truck `t` boards `f` at `a` in P(f) carrying `p`, and `p`
 never enters S again. `p` cannot be unloaded aboard, and if `t` disembarked at a port of P(f) then `p`
 would enter S again. So `t` stays aboard until it disembarks at a port outside P(f), and the first sail
 after the board is a departure from `a` with `t` aboard. Different L-events give different incidences
@@ -201,7 +201,7 @@ into S. At τ1 the truck is in S and `p` is not, so `p` is loaded into `t` betwe
 outside S. To stand there, `t` must have left the ferry node at a port outside P(f), so `f` departed from
 `a` with `t` aboard. Different events give different incidences. So `D >= ceil((mi - to) / k)`. ∎
 
-*Proof of 2, arrivals.* (iv) Take a package `p` of `wi` that is not part of `wn`, and its first-in event:
+_Proof of 2, arrivals._ (iv) Take a package `p` of `wi` that is not part of `wn`, and its first-in event:
 `t` disembarks from `f'` at `a'` in P(f') carrying `p`. Before that `p` was never in S, and it is not now
 aboard a ferry docked at a P port. So `t` took `p` aboard `f'` at a port outside P(f'), or is aboard `f'`
 docked outside P(f') now, and stayed aboard until `a'`. The last sail before the disembark is an arrival
@@ -215,7 +215,7 @@ of those packages later has a last out-crossing. Hence the number N of L-events 
 totals of M.
 Fix a truck `t` and look at its L-events in order. After an L-event `t` leaves by ferry and disembarks
 outside S (see (i)). Before its next L-event it must be in S again, so it enters S by a DISEMBARK after
-boarding outside P, which needs an arrival at a P port with `t` aboard. Before its *first* L-event, `t`
+boarding outside P, which needs an arrival at a P port with `t` aboard. Before its _first_ L-event, `t`
 also needs such an arrival, unless it is in S now (`ts` trucks) or it is aboard a docked ferry now and
 walks in (at most `free + |M|` trucks, where `free = ndock - |cargo|`). So the number of arrival
 incidences is at least `N - ts - free - |M|`, which is at least the minimum over all subsets that
@@ -224,7 +224,7 @@ With more than 10 cargo trucks the code skips the subsets and uses `mo - ts - nd
 `N >= mo` and `|M| <= |cargo|`, so `N - ts - free - |M| >= mo - ts - ndock`.
 So `A >= ceil(need / k)`. ∎
 
-*Proof of 3.* For one ferry of E, a sail from a P port to a non-P port is a departure only, the reverse
+_Proof of 3._ For one ferry of E, a sail from a P port to a non-P port is a departure only, the reverse
 is an arrival only, a sail between two P ports is one of each, and other sails are neither. So
 (departures - arrivals) of this ferry = [docked at a P port now] - [docked at a P port at the end], which
 lies between `-(1 - here_f)` and `here_f`. Sum over the ferries of E. ∎
@@ -246,13 +246,13 @@ In this section only, `cmax` is the largest truck capacity of the **whole game**
 `_build_fractions`), not of the region. It is at least the capacity of every truck, so F3 holds with it.
 Using the larger value only makes the bound smaller.
 H is built on `gports`, so it has a node for a ferry at its start port even if it does not serve it.
-The code then also gives H sail edges *into* that port, which no plan can use. Extra edges only shorten
+The code then also gives H sail edges _into_ that port, which no plan can use. Extra edges only shorten
 `d_p`, so the bound only gets smaller.
 
 **Lemma 3.** The cost of the DRIVEs over non-bridge roads, the BOARDs and DISEMBARKs over non-bridge port
 edges and the half-sails of non-bridge pairs is at least `sum over p of (w_p / cmax) * d_p`.
 
-*Proof.* The way of `p` through the plan is a walk in H from its place to its goal, of length at least
+_Proof._ The way of `p` through the plan is a walk in H from its place to its goal, of length at least
 `d_p`. Charge every step of the walk to the action that makes it, with weight `w_p / cmax`.
 A DRIVE or BOARD or DISEMBARK over a non-bridge edge costs 1 and is charged `sum of w_p / cmax` over the
 packages in that one truck, at most 1 by F3. A SAIL of `f` is charged, per non-bridge end,
@@ -277,17 +277,17 @@ The term `best` is the minimum, over the packages in the list `inside`, of `v(p)
 
 Two facts follow from the code when `best > 0`:
 
-* **(a)** every package in `inside` lies in U now. (A package in no side of Σ has `v = 0`.) Conversely
+- **(a)** every package in `inside` lies in U now. (A package in no side of Σ has `v = 0`.) Conversely
   every undelivered package that is in U now is in `inside`, because U only shrinks during the loop.
-* **(b)** no undelivered package that is outside U now has its goal in a side of Σ. (By (a) those packages
+- **(b)** no undelivered package that is outside U now has its goal in a side of Σ. (By (a) those packages
   are exactly the ones the loop classified as outside, and each of them removed the sides that contain its
   goal.)
 
 **Lemma 4.** If `best > 0`, the plan has at least `sum over Σ of g(v_X, 0, 0)  +  best` crossings of the
 bridges of Σ.
 
-*Proof.* Say that a package *has to go into X* if it is undelivered, outside X now, and has its goal in
-X, and *has to go out of X* if it is undelivered, in X now, with its goal outside. These are exactly the
+_Proof._ Say that a package _has to go into X_ if it is undelivered, outside X now, and has its goal in
+X, and _has to go out of X_ if it is undelivered, in X now, with its goal outside. These are exactly the
 packages behind `wi, bi` and `wo, bo` of the bridge. Packages that already lie at their goal are in
 neither set, whatever a plan does with them.
 
@@ -319,14 +319,14 @@ The bridges of Σ are road bridges that merge did not mark, so this excess is di
 
 ## 8. Merge bound
 
-Fix a goal `g` and the undelivered packages with this goal. A *group* is the set of those packages inside
-one truck, or lying at one location. Let there be `K >= 2` groups. For a group, its *path* is the set of
-bridges between its place and `g`. The *chain* C is the set of bridges on all K paths (not yet used).
-A bridge is *private* to group `i` if it is on the path of `i` and of no other group (and not used).
+Fix a goal `g` and the undelivered packages with this goal. A _group_ is the set of those packages inside
+one truck, or lying at one location. Let there be `K >= 2` groups. For a group, its _path_ is the set of
+bridges between its place and `g`. The _chain_ C is the set of bridges on all K paths (not yet used).
+A bridge is _private_ to group `i` if it is on the path of `i` and of no other group (and not used).
 For a private bridge `b` of `i` let `B_b` be the side of `b` that does not contain `g` (it contains the
 place of `i`).
 
-*Private sides are disjoint.* If `b` is private to `i` and `b'` to `j != i`, then `B_b` and `B_b'` are
+_Private sides are disjoint._ If `b` is private to `i` and `b'` to `j != i`, then `B_b` and `B_b'` are
 two subtrees of the bridge tree pointing away from `g`, so they are nested or disjoint. Nested would put
 the place of one group behind the private bridge of the other, making that bridge shared. So they are
 disjoint. In the same way, the truck of a truck group is never inside a private side of another group.
@@ -342,14 +342,14 @@ crossings of the private and chain bridges beyond the terms of sections 4 and 5.
 where the chain excess for `y` is `g(v, y, 0) - g(v, 0, 0)` (or `g(v, 0, y) - ...`) per chain road bridge
 and `max(0, y - bound)` per chain port bridge, with the direction in which the packages cross.
 
-*Proof.* For a chain bridge `e`, partition the packages by the crossing event of `e` that is their last
+_Proof._ For a chain bridge `e`, partition the packages by the crossing event of `e` that is their last
 crossing toward `g`. Let `y_e` be the number of classes, let `e*` minimise it, and put `y = min(K, y_e*)`.
 
-*Chain.* Every chain bridge has at least `y_e >= y` crossings toward `g`. By Corollary 1 it has at least
+_Chain._ Every chain bridge has at least `y_e >= y` crossings toward `g`. By Corollary 1 it has at least
 `g(v, y, 0)` crossings in total (road), or at least `y` BOARDs or DISEMBARKs of the right kind (port).
 So the excess over what sections 4 and 5 counted is at least the chain excess for `y`.
 
-*Merges.* If `y = K` nothing more is claimed. Let `y = y_e* < K`. Call group `i` *paid* if
+_Merges._ If `y = K` nothing more is claimed. Let `y = y_e* < K`. Call group `i` _paid_ if
 (a) every package of the group is loaded or unloaded at least 2 times more than the base term counts, or
 (b) the group is lying and every private bridge of it is crossed at least once in each direction.
 A paid group contributes at least `max(0, cost_i)` to E_g: in case (a) `2 * |group|`, in case (b) at least
@@ -381,21 +381,21 @@ first-entry term, and different goals have different packages. So the merge boun
 
 ## 9. Inputs outside the assignment's wording
 
-* **A ferry that starts at a port it does not serve.** It can be boarded there, and it can leave but never
+- **A ferry that starts at a port it does not serve.** It can be boarded there, and it can leave but never
   return. G and H contain that port for this ferry (`gports`), so F1 holds as stated. Lemma 2.3 counts the
   sails that actually happen, so it is unaffected. Sailing targets still come from the served ports only.
-* **A ferry for 0 trucks.** Nobody can board it. The bounds use `max(k, 1)`, which is still an upper bound
+- **A ferry for 0 trucks.** Nobody can board it. The bounds use `max(k, 1)`, which is still an upper bound
   on the trucks aboard.
-* **Only trucks of capacity 0.** `cmax` is taken as at least 1, still an upper bound on every capacity.
-* **A package that cannot reach its goal** (start and goal in different parts of the map). There is no
+- **Only trucks of capacity 0.** `cmax` is taken as at least 1, still an upper bound on every capacity.
+- **A package that cannot reach its goal** (start and goal in different parts of the map). There is no
   plan, `h*` is infinite, and the code returns `h = 0` and no successors.
 
 ## 10. Assembly
 
 Let L be the cost of the LOADs and UNLOADs of the plan and M the cost of all other actions.
 
-* `L >= base + (LOAD/UNLOAD part of xfer)` by sections 3 and 8.
-* `M >= T2 / 2 + (crossing part of xfer)`: the road-bridge, port-bridge, first-entry and non-bridge terms
+- `L >= base + (LOAD/UNLOAD part of xfer)` by sections 3 and 8.
+- `M >= T2 / 2 + (crossing part of xfer)`: the road-bridge, port-bridge, first-entry and non-bridge terms
   are lower bounds on pairwise disjoint sets of movement actions and half-sails (table in section 2),
   the crossing part of `xfer` is an excess over the bridge terms on bridges no other excess uses, and the
   additivity principle applies. Regions add because they share nothing.
@@ -416,18 +416,18 @@ It proves that the **bound described here** is admissible. That `ex1.py` compute
 (bit packing, bridge detection, prefix sums, caches and memo keys) is an implementation question, and the
 evidence for it is the exhaustive test, not this text:
 
-* 2,223 solvable random games, the whole reachable state space enumerated with an independent
+- 2,223 solvable random games, the whole reachable state space enumerated with an independent
   implementation of the rules, exact `h*` for every state: `h <= h*` on 16.5 million world states and on
   21.1 million successor-reachable states, zero violations. (Re-run on this version of the code.)
-* 515 more solvable games with inputs outside the assignment's wording (ferry starting at a port it does
+- 515 more solvable games with inputs outside the assignment's wording (ferry starting at a port it does
   not serve, ferry for 0 trucks, truck of capacity 0): the same checks on 2.9 million world states, zero
   violations. 683 unsolvable games in total: no plan returned, no crash.
-* Larger games (up to 24 locations, 7 packages, plans up to cost 65), too large to enumerate: 402 games (329 solvable)
+- Larger games (up to 24 locations, 7 packages, plans up to cost 65), too large to enumerate: 402 games (329 solvable)
   solved three ways (submitted configuration, heuristic without the first-entry and merge terms, all
   pruning rules off). Every pair of results that finished agrees on the cost: 402 of 402 for the weaker
   heuristic, 390 of 390 for no pruning.
-* The cached values go through the same check, so a wrong memo key would show as a violation.
-* On the real problems (p1, p3, x1..x8, y1): no violation on the states of the optimal plans or on about
+- The cached values go through the same check, so a wrong memo key would show as a violation.
+- On the real problems (p1, p3, x1..x8, y1): no violation on the states of the optimal plans or on about
   320 random reachable states.
 
 Limits: exact `h*` is only available on small games (at most 12 locations, 4 packages). The larger
@@ -448,7 +448,7 @@ problems, and equal to the cost found with all pruning off on 390 larger games) 
    one truck inside returned 0, two trucks returned 200). It also said that all terms are non-negative.
 2. The fractions use the largest capacity of the whole game, not of the region. Safe, now stated.
 3. Section 7 defined τ as the first load of any package in U. A plan may first pick up a package that
-   already lies at its goal inside U. τ is now the first load of an *undelivered* package in U.
+   already lies at its goal inside U. τ is now the first load of an _undelivered_ package in U.
 
 **Revision 3** (code and text). The code changed in these places, and nowhere else:
 
@@ -482,11 +482,15 @@ The new terms are proved below. None depends on path cost, search order, or the 
 ### 13.1 Packages that cannot share a truck
 
 Let C be the largest truck capacity, bounded below by 1 as before, and m the smallest strictly positive
-package weight in the input. Define the fractional weight of p as C when `w_p + m > C`, and as `w_p`
-otherwise. A package whose fractional weight is increased cannot be in a legal truck with any other
-positive-weight package: their actual combined weight would exceed C. Zero-weight packages retain
-fractional weight zero. Consequently every legal truck load has total fractional weight at most C.
-For inputs with no positive-weight packages there is nothing to increase in any legal load.
+package weight in the input. Define the fractional weight of p as C when `w_p > 0` and `w_p + m > C`,
+and as `w_p` otherwise. So a package of weight 0 always has fractional weight 0.
+
+_Claim: every legal truck load has total fractional weight at most C._ If no package in the load was
+raised, the fractional weights are the real weights, which sum to at most the truck's capacity, at most
+C. If some package p in the load was raised, then `w_p > 0` and `w_p + m > C`. Any other package of
+positive weight in the load weighs at least m, so the real weights would exceed C, which is impossible.
+Hence every other package in the load has weight 0 and fractional weight 0, and the total is exactly C.
+With no positive-weight package in the input, nothing is raised.
 
 Replace `w_p` by this fractional weight in Lemma 3. Its action-charging proof is unchanged: no truck
 pays more than one unit per DRIVE/BOARD/DISEMBARK, and no ferry pays more than its allotted half-sail.
@@ -553,17 +557,32 @@ zero-cost placement; all non-negative terms are consequently zero.
 
 ### 13.4 Cache keys preserve the computed bounds
 
-* Flow is cached by its conditional excess vectors. The tree and T are fixed for the region; all other
+- Flow is cached by its conditional excess vectors. The tree and T are fixed for the region; all other
   information has already been consumed in those vectors.
-* `_road_extra` is cached by all cut values, the complete pending-package bucket, and the port crossing
+- `_road_extra` is cached by all cut values, the complete pending-package bucket, and the port crossing
   bounds. Those are its complete dynamic inputs.
-* `_ferry_bound` records, for each truck and package, its membership in every port-bridge side and every
+- `_ferry_bound` records, for each truck and package, its membership in every port-bridge side and every
   piece, together with ferry positions, truck-to-ferry assignments and aboard-package holders. Road
   coordinates within those same memberships cannot affect any of its counts. Its key therefore omits
   them. Membership masks use separate bit ranges for port bridges and pieces.
-* The single-region movement cache omits the holder only for a standing package whose goal is not a
+- The single-region movement cache omits the holder only for a standing package whose goal is not a
   merge candidate. In the movement calculation that holder is used neither for ferry cargo nor for
   grouping a merge; all remaining terms use the package's physical node. Its LOAD/UNLOAD base is still
   computed separately for the actual state.
 
 These caches change neither the bounds nor admissibility. They use no estimated solution costs.
+
+### 13.5 Correction in revision 5
+
+Revision 4 raised the fractional weight whenever `w_p + m > C`, without requiring `w_p > 0`. When every
+positive-weight package is heavier than every truck (`m > C`), that also raised packages of weight 0 to
+C, and two of them in one truck were charged 2C. The claim of 13.1 then fails and `h` can exceed `h*`.
+
+Counterexample found by reading the proof against the code: roads 0-1, 1-2, 2-0, one truck of capacity 1
+at 0, one package of weight 5 lying at its goal 2, two packages of weight 0 at 0 with goal 1. The optimum
+is 5 (two LOADs, one DRIVE, two UNLOADs). Revision 4 returned `h = 6`.
+
+The code now has the condition `w > 0`, as section 13.1 states. On the 18 given problems the heuristic
+value of every evaluated state, the number of expansions and the plan cost are unchanged. The random
+validation games have no zero-weight packages, which is why the earlier runs did not show this. The
+counterexample should be added to the edge-case script as a regression case.

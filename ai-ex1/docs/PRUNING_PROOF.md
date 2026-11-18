@@ -1,18 +1,19 @@
 # Optimality proof for the search in `ex1.py`: pruning, state merging, and their combination with the heuristic
 
-Written against `ex1.py` with md5 `ce80d776d4c33c27b1e3aa0bb76617a6`. Updated for the additional normal forms in section 10. Companion of `ADMISSIBILITY_PROOF.md` (cited as [H]), which proves `h <= h*`.
+Written against the Git (LF) contents of `ex1.py` with md5 `5feb2f57385ffc13eba96fd5bb576ff6`. Companion of `ADMISSIBILITY_PROOF.md` (cited as [H]), which proves `h <= h*`.
 
-Status in one line: the original staged construction is extended by section 10. Section 9 lists the
-pre-existing caveats; section 10 documents the current additional rules.
+Sections 1–10 prove the normal forms for nonnegative integer cargo. Section 11 treats other
+weights under the simulator's LOAD rule.
 
 ## 0. The claim
 
-**Theorem P.** For every solvable game in which every ferry starts at a port it serves, `astar_search`
-of `search.py`, run with `successor`, `goal_test` and `h_astar` of `ex1.py`, returns a legal plan of the
-minimum possible cost C\*.
+**Theorem P.** For every solvable game in the domain of [H], section 0, `astar_search`
+of `search.py`, run from the game's designated initial layout with `successor`, `goal_test` and
+`h_astar` of `ex1.py`, returns a legal plan of the minimum possible cost C\*.
 
-The assumption on ferries is used in one place only (Lemma 5, symmetry of the static data). Inputs
-without it are covered by tests, not by this proof (section 9).
+Sections 0.1–0.2 of [H] prove `h <= h*` by projecting real loads into an integer problem
+and bounding the cost of every completion there.
+Only the heuristic uses the relaxed truck loads. Successor legality is checked in the real world.
 
 Notation. _World rules_ = the six actions of the assignment with all their preconditions. C* = the least
 cost of a sequence of world-legal actions from the start to a goal. A *plan\* is such a sequence.
@@ -41,8 +42,10 @@ sails immediately followed by BOARD. Their implementation and proof are in secti
 - **G2** (used only in the original proof): G1 without R3, and with R2 relaxed to "its only action is to unload
   _some_ such package". G1 is a subgraph of G2, and G2 is a subgraph of G0 on the essential state below.
 
-A _class_ is: trucks of equal capacity, packages of equal weight and goal, ferries with the same served
-ports and capacity. `_State` treats two tuples as equal when `_canon` gives the same key.
+A truck class has one effective capacity (floored for integer cargo). A package class has one weight
+and goal, or one identity in section 11. A ferry class has one served-port set, one set of graph
+neighbours including its initial dock, and one truck-slot count. `_State` treats two tuples as equal
+when `_canon` gives the same key.
 
 **Essential state.** Erase from a tuple (i) the positions of trucks and ferries of parts ranked below the
 active one, (ii) which package a "has just loaded" focus refers to. `_successors` reads neither: finished
@@ -56,7 +59,7 @@ For a graph G let `V_G(s)` be the least cost of a path in G from `s` to a goal s
 
 ## 2. What has to be shown
 
-1. **Lemma 0** (soundness): every G1 path from the start is a plan.
+1. **Lemma 0** (soundness): every goal-reaching G1 path from the start is a plan.
 2. **Lemma 4** (completeness): G2 contains a path from the start of cost C\*.
 3. **Lemma 6**: `V_G1 = V_G2` on every state.
 4. **Lemma 5**: `V_G2` is the same for states that `_State` treats as equal.
@@ -66,13 +69,18 @@ For a graph G let `V_G(s)` be the least cost of a path in G from `s` to a goal s
 
 By inspection of `_truck_standing`, `_sail` and `_successors`: DRIVE is generated for a truck whose code
 is a location, along `adj_go`, a subset of the roads. LOAD for a package lying at the truck's location
-whose weight fits the remaining capacity. UNLOAD for a package inside a standing truck. BOARD for a ferry
+whose held-weight sum plus the new weight fits the capacity, as in section 11. UNLOAD for a package inside a standing truck. BOARD for a ferry
 docked at the truck's location with fewer trucks aboard than its capacity. DISEMBARK for a truck aboard.
 SAIL to a port in `sail_to`, a subset of the served ports, different from the current one. The new tuple
 is the old one with exactly the effect of the action (plus the fresh bit, the focus, and the write-back
 of R10, none of which is world state of an object that acts again). ∎
 
-So `V_G1(s) >= h*(s)`, and with [H]: `h(s) <= h*(s) <= V_G1(s)` for every state.
+For any reachable search state, fix a world replay of its path. The unfinished regions have
+the same positions and custody in both representations. A finished region has no pending
+package and contributes zero to `_bound` regardless of the vehicle positions written by R10.
+Thus the heuristic equals its value on the world replay even if an unserved dock makes the
+reset tuple itself unreachable. Any goal-reaching continuation replays legally at the same cost.
+Applying [H] to the reachable replay gives `h(s) <= h*(replay) <= V_G1(s)`.
 
 ## 4. Lemma 4: an optimal plan survives all rules
 
@@ -95,20 +103,23 @@ that hangs on the core by one bridge. Define a map ρ, the identity on the core,
 
 - the bridge is a road `(x, y)` with `y` in D: ρ(D) = the location `x`,
 - the bridge is a port edge `(u, f)` with the ferry `f` in D: ρ(D) = the location `u`,
-- the bridge is a port edge `(u, f)` with the port `u` in D: ρ(D) = `z`, a port of `f` in the core. (It
-  exists: `f` is in the core. If its 2-edge-connected part has another node, that part contains a port of
-  `f`. Otherwise `f` lies between two marked sides, and the first node on the way to either is a port.)
+- the bridge is a port edge `(u, f)` with the port `u` in D: choose ρ(D) = `z`, a **served** port of
+  `f` in the core. If `f` belongs to a nontrivial bridge component it has at least two neighbours
+  in that component. Otherwise its unmarked singleton lies strictly between two marked sides and has
+  at least two core neighbours. At most one neighbour is an unserved initial dock, so a served choice exists.
 
 Apply ρ to the whole plan: a truck in D counts as standing at ρ(D), a ferry docked at a dead port `u`
 counts as docked at `z`. Actions that move nothing after the mapping are dropped (drives inside D, sails
 between two ports that map to the same port, everything done with ferries inside D). LOAD and UNLOAD in D
-happen at ρ(D). A ferry that _starts_ at a dead port keeps its real position until its first sail: no
-truck starts in a dead side and none can reach it before the ferry moves, so nothing happens there.
+happen at ρ(D). A core ferry initially docked in D is the unique way for a truck to enter D.
+Until that ferry first sails, no truck can board it there. For its first original sail use the
+actual initial dock as source and the mapped target as destination, even if the two *mapped*
+ports coincide. That destination is served, and this costs at most the one original sail.
 
 The result is a plan: every remaining action has the same objects and the same contents, trucks that
 were together at a location of D are together at ρ(D), a sail between any two served ports is one action,
-and the number of trucks aboard a core ferry is unchanged. No package starts or ends in D, so the final
-state is the same. The cost does not grow. The new plan never enters a dead side, never sails to a dead
+and the number of trucks aboard a core ferry is unchanged. No package starts or ends in D, so all final
+package goals are preserved. The cost does not grow. The new plan never enters a dead side, never sails to a dead
 port, and never uses a dead ferry: exactly `dead_drive`, the bridge part of `dead_sail`, and `dead_ferry`.
 
 _Dominated ports._ An island I (locations joined by roads) without marks and without a ferry docked at
@@ -217,12 +228,13 @@ Check every rule of G2 on the final plan π.
   not dead (R9). That is the bit the code tests in `useful`.
 - R9, R10: stages 2 and 1.
 
-π has cost C* and every G2 path is a plan, so `V_G2(start) = C*`. ∎
+π has cost C* and every goal-reaching G2 path from the start is a plan, so `V_G2(start) = C*`. ∎
 
 ## 5. Lemma 5: symmetry of G2
 
-**Static data.** If every ferry starts at a served port, two ferries of one class have the same
-neighbours in the map graph, so exchanging them is an automorphism of that graph that fixes all marks.
+**Static data.** The ferry class key includes both `fports` and `gports`. Two ferries of one class
+have the same legal destinations and precisely the same neighbours in the map graph, including any
+unserved initial dock. Exchanging their graph nodes is therefore an automorphism fixing all locations and marks.
 Hence `dead_ferry` and `dead_sail` treat them alike, and so does the dominated-port rule, which speaks
 about "every ferry that serves the island". Trucks and packages carry no static pruning data beyond their
 class and their part.
@@ -250,6 +262,10 @@ look at its first edge that is not in G1. Only R3 or the "lowest-numbered" part 
   the same place, two empty trucks with the same capacity and code and no focus set, two empty ferries of
   one class at one port. So the exchange τ of `x` and `x0` fixes the state. By equivariance, renaming the
   rest of the path by τ gives a G2 path from the same state, of the same cost, whose first edge uses `x0`.
+  A LOAD can require both a truck swap and a package swap. A BOARD can require both a truck swap and
+  a ferry swap. The truck in the truck-twin rule is empty, the package twins lie together, and the
+  ferry twins are empty at the same port. Swaps across these object types preserve each other's
+  eligibility and fix the current state. Compose all required swaps before advancing to the next edge.
 - **R2.** Truck `t` unloads the goal-bound `q` where G1 demands the goal-bound `p`. In G2 every action of
   `t` is an UNLOAD of a goal-bound package until none is left, so the path contains `UNLOAD(p, t)` later,
   with only actions of other objects and such UNLOADs of `t` in between. Exchange the two UNLOADs. The
@@ -337,13 +353,9 @@ occurred, so no rule was weakened or removed.
 
 ## 9. What this proof does and does not establish
 
-- Proved: Theorem P for the rules **as described in section 1**, under the stated assumption on ferries.
+- Proved: Theorem P for the rules in sections 1, 10 and 11.
 - By inspection plus tests: that `_successors` implements exactly these rules (P3 and the reading in
   section 1), and that `_canon` equality is the renaming equivalence of Lemma 5.
-- **Not proved: inputs where a ferry starts at a port it does not serve.** Lemma 5's "static data" step
-  fails to apply, so for these inputs the correctness of twins and state merging rests on tests only
-  (profile X, including P2). Until that step is proved or the rules are switched off for such inputs,
-  pruning correctness there is an open item, not a settled one.
 - The proof was written by an LLM. The steps most worth a second reading: stage 2 (the map ρ and the
   ferry that starts at a dead port), stage 4, and the R2 case of Lemma 6.
 - Not covered at all: running time.
@@ -441,8 +453,10 @@ The normal form proved above uses a narrower set of edges than these: the sail g
 boards next, and that truck boards. The code generates more. In case 3 _any_ truck standing at the port
 may board, not only the one the sail was meant for. In case 2 the sail is offered even when `t` has a
 forced goal UNLOAD pending, and the twin rule R3(e) is not applied to it. In case 3 the twin rule R3(d)
-is not applied. Each of these extra edges is a legal action with its real effect (the ferry is empty, has
-capacity at least one, and the truck stands at its port), so Lemma 0 still holds. Adding edges to a graph
+is not applied. Every generated BOARD is legal because the ferry is empty, has capacity at least one,
+and the truck stands at its port. The no-focus sail branch also permits a zero-capacity empty ferry
+to sail to a waiting truck. That SAIL is world-legal and its pending state has no successors. Such a
+branch has no path to a goal and adds no completion. Thus Lemma 0 still holds. Adding edges to a graph
 that already contains a plan of cost C\* cannot remove that plan, so Lemma 4 still holds. The extra edges
 are stated through positions and classes only, so they are equivariant and Lemmas 5 and 6 are unaffected.
 
@@ -462,4 +476,32 @@ prevent an empty truck from approaching a needed boarding port across a road bri
 
 Together, the corridor mapping, eager deliveries, and delayed empty-sail/BOARD pairs can be applied
 before the existing focus/no-op/twin/component normalizations. They preserve at least one optimal plan.
-The pre-existing caveat in section 9 about symmetry for unserved initial ferry ports remains unchanged.
+
+## 11. Legal loads with fractional or signed cargo
+
+For nonnegative integer package weights, any integer load fits a truck of capacity C exactly when
+it fits floor(C). Sections 1–10 apply directly. For every other weight list, `_successors` visits
+packages in the original dictionary order when building each truck's cargo list. The LOAD comparison
+computes `sum(held_weights) + new_weight <= original_capacity` using that same order and the same
+Python operations as `World.load_of` and `World.load`. This matters at a floating-point boundary.
+The integer surrogate loads from [H] do not participate in this test.
+
+For this second case, take a cheapest real plan. Stage 1 reorders regions and can stop each region
+as soon as all its packages are delivered, since other regions cannot use its objects. The corridor
+and dead-side projections preserve the order and identity of every package handled by each truck.
+Thus each projected LOAD sees the same held-package set and gives the same numerical test. The lazy
+empty-sail transformation also preserves all holdings. Apply stage 5 to the resulting plan. Moving
+a truck's DRIVE or LOAD past another object's independent action preserves its own sequence and
+holdings, including at an empty-SAIL/BOARD pair. These transformations retain a plan of cost C*.
+
+The code allows picking up a package lying at its goal, leaves goal unloading optional and permits an
+UNLOAD directly after a LOAD (R1, R2, R4 and global eager unloading are disabled). No argument about
+freeing weight or reordering loads at a stop is required. For R8 all lying packages, including
+delivered ones, mark their side useful. The original first-LOAD-or-BOARD argument therefore also
+covers fetching a signed package for its effect on capacity. The remaining movement rules follow
+from the same cheaper round-trip deletions, which preserve holdings at every retained LOAD.
+
+Every package has its own class here. Permuting equal-capacity trucks or equal-class ferries preserves
+the identities, and hence the fixed summation order, of all packages in each corresponding truck.
+The symmetry and lowest-number arguments of sections 5–6 apply with singleton package classes.
+With the integer projection proof of [H], Lemma 7 then gives the optimal cost for this case as well. ∎

@@ -1,28 +1,83 @@
 # Admissibility proof for `h_astar` in `ex1.py`
 
-Written against `ex1.py` with md5 `ce80d776d4c33c27b1e3aa0bb76617a6`.
+Written against the Git (LF) contents of `ex1.py` with md5 `5feb2f57385ffc13eba96fd5bb576ff6`.
 If the heuristic code changes, the matching section here has to be rechecked.
 
-Revision 5 (2026-11-16). Section 13 proves the new bounds and cache keys, and supersedes the older
-assembly formula in section 2. Revision 5 corrects section 13.1 and the code it describes (see 13.5). Sections 1–12 retain the supporting lemmas and revision history.
+Revision 8 (2026-11-18). Section 0 gives the theorem and proof for an arbitrary state.
+Section 13 gives the implementation's formula and §14.3 proves its cost inequality.
 
 ## 0. The claim
 
-**Theorem.** For every game and every state `s`, `h(s) <= h*(s)`, where `h*(s)` is the cheapest total cost
-of any sequence of legal actions that leads from `s` to a goal state (infinite if there is none).
-Also `h` is a non-negative integer and `h = 0` on goals.
+**Theorem.** Fix a finite, well-formed assignment instance with finite package weights and finite
+nonnegative capacities. LOAD uses the simulator's sum of held weights plus the new weight, with
+numeric inputs on which its additions and comparisons are defined. Let S contain every well-formed
+world of this instance. Each ferry is at a port, each truck is at a location or aboard one ferry,
+and each package is at a location or in one truck. A ferry of capacity k carries at most ceil(k)
+trucks. If every weight is a nonnegative Python integer, each truck's current load must fit its
+capacity. For other weight lists the proof allows any current holdings. This covers signed cargo
+whose total weight can rise above capacity when a negative-weight package is unloaded.
+Positions may be chosen independently of the designated initial layout. Any valid encoding of
+the pruning-history flags is allowed.
 
-`h*` ranges over **all** legal actions, not only the ones the pruned `successor` generates. Pruning can
-only make the remaining cost larger, so this is at least as strong as anything a grader can measure.
+Let h*(s) be the minimum cost of a sequence of **simulator-legal** actions that takes s to any goal,
+with h*(s) = ∞ when no such sequence exists. Let h(s) be `h_astar` on a node encoding s. Then
 
-There is no assumption on the input beyond the format of the dictionary. Revisions 1 and 2 needed two
-(every ferry starts at a port it serves, every ferry holds at least one truck). Section 9 says how the
-code now covers them.
+$$\forall s\in S,\qquad 0\le h(s)\le h^*(s),\qquad h(s)\in\mathbb Z.$$
+
+Zero weights, fractional weights and capacities, and an initial dock outside the served ports are
+covered. The same admissibility conclusion holds even for signed package weights under the simulator's rules.
+
+### 0.1 Projection to integer loads
+
+Fix the instance and write P for its total number of packages. The heuristic reads only
+`bound_weights` and `bound_caps` for cargo. A truck, ferry and package have the same identities,
+locations and goals in the projected problem. The following cases determine the projected loads.
+
+* **Every package weight is a nonnegative Python integer.** Keep each weight and replace each truck
+  capacity C by floor(C). Every proposed load has an exact integer total z, and
+  `z <= C` if and only if `z <= floor(C)`. This preserves the full set of legal loads, even
+  if C is fractional. The successor generator may use the same floored capacity.
+* **Any other package weight.** Give every package weight 1 and every truck capacity P in the
+  projected problem. An actual LOAD introduces a package that was lying on the ground, so at most
+  P distinct packages are inside the truck afterward. The projected LOAD is legal. This argument
+  is independent of rounding, summation order and sign in the original load test. Actual successors
+  still use the original weights and capacities.
+
+For a ferry with capacity k the simulator admits a BOARD exactly when the current integer truck
+count j satisfies `j < k`, equivalently `j < ceil(k)`. The code uses that integer number of slots.
+Every other action has the same location and custody preconditions, effects, and cost in both worlds.
+Write φ(s) for the same layout under these projected loads. It is a valid starting state of the
+projected problem. In the first case its current integer loads fit the floored capacities. In the
+second each truck holds at most P packages. Induction on the successive actions of **any completion
+from s** now gives a projected completion from φ(s) with identical positions, custody and cost.
+Consequently `h*_projected(φ(s)) <= h*_real(s)`. Below, weights and capacities are the projected
+integers unless a historical implementation is identified.
+
+### 0.2 Proof for an arbitrary state
+
+Fix any s ∈ S. Three checks protect the assumptions of the precomputed bound. If the initial
+layout had a package separated from its goal, `h_astar` returns 0. It also returns 0 if a ferry's
+current dock is outside its precomputed docking edges, or if the current regional assignments fail
+the checks in §14.2. In each such case h(s) = 0 ≤ h*(s), since action costs are nonnegative.
+
+Otherwise fix **any** legal completion π from s. By §0.1 its actions form a projected completion
+from φ(s) of cost cost(π). Partition those actions by region. In each region §14.3 proves that
+the exact integer contributed by the code is at most the cost this completion spends there.
+In particular, `merge + first_entry` and `truck_flow_excess` can charge the same crossing.
+The code takes their maximum. Section 14.3 bounds both by the same available excess.
+Adding across regions gives h(s) ≤ cost(π). Equivalently, minimizing first over all projected
+completions and then applying §0.1 gives
+
+$$h(s)\;\le\;h^*_{\rm projected}(\varphi(s))\;\le\;h^*(s).$$
+
+If there is no completion, the finite integer returned by the code is bounded by ∞. Section 14.3
+also proves nonnegativity, so the empty completion at a goal forces h(s) = 0. Since s was arbitrary,
+the theorem follows. ∎
 
 ## 1. The model
 
-Fix a state and any plan from it that delivers every package. All counts below ("the number of ...")
-refer to this plan.
+Fix a state that passes the checks in §0.2 and any projected plan from it that delivers every package.
+All counts below refer to this plan.
 
 **Graph G.** Nodes: every location, and one node per ferry. Edges: a _road edge_ per road, and a
 _port edge_ `(a, f)` for every port `a` that ferry `f` serves and for the port where `f` starts
@@ -48,14 +103,10 @@ lower bound on its cost that holds for every plan, then the sum of the bounds is
 cost of the plan. Trucks, ferries and packages never leave their region, so different regions always
 give disjoint sets.
 
-## 2. What h is, and which actions each term claims
+## 2. Which actions each term claims
 
-```
-h = base + sum over regions [ ceil(T2 / 2) + xfer ]
-T2 = 2 * sum(road bridges) + sum(port bridges) + 2 * first_entry + max(pieces + ceil(road fractions), ceil(all fractions))
-```
-
-`T2` is in doubled units (a DRIVE is 2, a half-sail is 3) so that everything stays an integer.
+The exact expression is in §13. The movement terms use doubled costs, with 2 for a DRIVE and
+3 for one half of a SAIL.
 
 | term                | code                    | actions it claims                                                                               | proved in |
 | ------------------- | ----------------------- | ----------------------------------------------------------------------------------------------- | --------- |
@@ -67,9 +118,9 @@ T2 = 2 * sum(road bridges) + sum(port bridges) + 2 * first_entry + max(pieces + 
 | first entry         | `first_in`, `first_out` | DRIVEs over road bridges, beyond the road-bridge term, only on bridges merge does not use       | 7         |
 | merge               | `merge`, `_merge_goal`  | LOAD / UNLOAD beyond base, and crossings beyond the bridge terms on the bridges it marks `used` | 8         |
 
-These sets are pairwise disjoint: different edges are different actions, bridge and non-bridge edges are
-different edges, half-sails are indexed by (port, ferry) pairs that follow the same split, and the three
-"beyond" terms are defined as the excess over the term they extend. Section 10 assembles them.
+Different edges claim distinct crossing actions. Each half-sail belongs to one (port, ferry) pair.
+The all-fractions alternative overlaps the piece bounds, and the truck-flow excess can overlap merge
+and first entry. Section 14.3 accounts for both overlaps when assembling the regional bound.
 
 ## 3. Base term
 
@@ -122,10 +173,11 @@ Call a pair `(zo, zi)` _feasible for_ `(cs, co)` if it satisfies 2 and 3 with th
 The code takes the minimum over all these cases. (Checked against an exhaustive search over pairs on
 40,000 random inputs, 2,296 of them needing more than 200 crossings.)
 
-**Corollary 1.** If the pair `(zo, zi)` of the plan is feasible for some truck lists `(cs', co')` and
-`zo >= a`, `zi >= b`, then `_crossings(wo, wi, bo, bi, cs', co', a, b) <= zo + zi`.
-In particular (with the true truck lists, where Lemma 1 gives feasibility) the plan has at least
-`g(v, a, b)` crossings of `e`, and at least `g(v, 0, 0)` DRIVEs over `e`.
+**Corollary 1.** If a pair `(zo, zi)` is feasible for some truck lists `(cs', co')` and
+`zo >= max(a, bo)`, `zi >= max(b, bi)`, then `_crossings(wo, wi, bo, bi, cs', co', a, b) <= zo + zi`.
+Lemma 1(1) supplies the big-package inequalities for every real plan, including when only the truck lists are relaxed.
+In particular, with the true truck lists, every plan has at least `g(v, 0, 0)` DRIVEs over `e`.
+If the plan has at least a outward and b inward crossings, it has at least `g(v, a, b)` in total.
 
 **Remark.** Adding a truck to `cs` or `co`, or enlarging a capacity, only enlarges the set of feasible
 pairs, and raising `a` or `b` only shrinks the set of candidates. Since the returned value is the exact
@@ -171,7 +223,7 @@ Let D and A be the numbers of departures from, and arrivals at, P ports by the f
 3. `D >= A - away` and `A >= D - here`.
 
 So the cost of the BOARDs, DISEMBARKs and half-sails of E is at least
-`boards + disemb + 1.5 * (max(d0, a0 - away) + max(a0, d0 - here))`, which is half of what the code returns.
+`boards + disemb + 1.5 * (max(d0, a0 - away) + max(a0, d0 - here))`, which is half the first entry returned by `port_cost`.
 
 _Proof of 1._ Call an out-crossing an _L-event_ if it is the last out-crossing of some package that has to
 go out. The packages that share an L-event are in one truck at one moment, so by F3 there are at least
@@ -231,8 +283,8 @@ lies between `-(1 - here_f)` and `here_f`. Sum over the ferries of E. ∎
 
 **Disjointness.** Different port bridges are different (port, ferry) pairs, the sets E of the pieces are
 disjoint and contain no bridge, and half-sails follow the pairs (F5). So all port-bridge terms and all
-piece terms add. A cut is skipped by the code when nothing has to cross it and no truck is aboard there,
-which only drops a non-negative term.
+piece terms add. The code can skip a cut with zero measured demand even when a weight-zero package
+must cross it. Assigning zero to a skipped cut always gives a lower bound.
 
 ## 6. Fractions
 
@@ -242,7 +294,7 @@ edge. Edge lengths, in units of one action: non-bridge road 1, non-bridge port e
 sections 4 and 5 already charge to a bridge has length 0. `d_p` is the shortest length in H from where
 `p` is to its goal (the relaxation loop computes exactly this, edges are symmetric).
 
-In this section only, `cmax` is the largest truck capacity of the **whole game** (`max(self.tcap)` in
+In this section only, `cmax` is the largest projected truck capacity of the **whole game** (`max(self.bound_caps)` in
 `_build_fractions`), not of the region. It is at least the capacity of every truck, so F3 holds with it.
 Using the larger value only makes the bound smaller.
 H is built on `gports`, so it has a node for a ferry at its start port even if it does not serve it.
@@ -262,18 +314,18 @@ the part of its cost that is listed in the lemma. ∎
 
 With the roads-only table (`wd_road`) the same proof gives a bound on the non-bridge DRIVEs alone.
 
-The code adds `max(pieces + ceil(road fractions), ceil(all fractions))`. Both alternatives are lower
-bounds on the doubled cost of the same set of non-bridge actions: the first is the sum of two bounds on
-disjoint subsets (piece terms from section 5, non-bridge DRIVEs), the second is Lemma 3. Each rounded
-quantity is a bound on an integer (the doubled cost of a fixed set of actions and half-sails), so rounding
-up is allowed. The maximum of two lower bounds on one quantity is a lower bound. ∎
+The road fraction can be added to the piece terms because it claims only non-bridge DRIVEs.
+The all-fractions value can claim the very same port actions as the pieces. Section 14.3 applies
+the maximum to the two alternatives in doubled units and justifies each ceiling. ∎
 
 ## 7. First entry (`OPT_FIRST`)
 
 Let Σ be the set of sides that survive in `cs` / `cc`: each X in Σ is a side of a road bridge `e_X` that
 merge did not use, has no truck in it now, and some package has to cross `e_X`. Let U be their union.
 The term `best` is the minimum, over the packages in the list `inside`, of `v(p)` = the sum of
-`first_in` / `first_out` over the sides of Σ that contain `p`. Nothing is added unless `best > 0`.
+`first_in` / `first_out` over the sides of Σ that contain `p`, when the loop runs to completion.
+Stopping on a zero candidate makes the adjustment zero. Any nonpositive adjustment is already
+bounded by the excess above the unconditional road bound.
 
 Two facts follow from the code when `best > 0`:
 
@@ -342,7 +394,7 @@ crossings of the private and chain bridges beyond the terms of sections 4 and 5.
 where the chain excess for `y` is `g(v, y, 0) - g(v, 0, 0)` (or `g(v, 0, y) - ...`) per chain road bridge
 and `max(0, y - bound)` per chain port bridge, with the direction in which the packages cross.
 
-_Proof._ For a chain bridge `e`, partition the packages by the crossing event of `e` that is their last
+_Proof._ With an empty chain the code contributes zero and stops. Otherwise, for a chain bridge `e`, partition the packages by the crossing event of `e` that is their last
 crossing toward `g`. Let `y_e` be the number of classes, let `e*` minimise it, and put `y = min(K, y_e*)`.
 
 _Chain._ Every chain bridge has at least `y_e >= y` crossings toward `g`. By Corollary 1 it has at least
@@ -375,9 +427,12 @@ So at most `y` groups are unpaid and at least `K - y` are paid. Their contributi
 of the `K - y` smallest values of `max(0, cost_i)`, which is at least the sum of the `K - y` smallest
 costs. ∎
 
-Every bridge that the bound of one goal looks at is marked `used` and is skipped by later goals and by the
-first-entry term, and different goals have different packages. So the merge bounds of the goals add, and
-`xfer` is their sum.
+In `_merge_goal`, a port bridge absent from `pres` contributes zero to both its private detour and
+its chain excess. Dropping either nonnegative contribution can only decrease the minimum in Lemma 5.
+For example, two weight-zero packages in separate trucks at port 0, both destined for port 1 of one
+ferry, can have both intervening port bridges absent. A positive goal bound reserves its chain and
+private bridges in `used`. A zero bound spends no excess and reserves nothing. Distinct goals have
+distinct packages, so the positive goal bounds add, and the first-entry calculation skips their bridges.
 
 ## 9. Inputs outside the assignment's wording
 
@@ -387,38 +442,25 @@ first-entry term, and different goals have different packages. So the merge boun
 - **A ferry for 0 trucks.** Nobody can board it. The bounds use `max(k, 1)`, which is still an upper bound
   on the trucks aboard.
 - **Only trucks of capacity 0.** `cmax` is taken as at least 1, still an upper bound on every capacity.
-- **A package that cannot reach its goal** (start and goal in different parts of the map). There is no
-  plan, `h*` is infinite, and the code returns `h = 0` and no successors.
+- **A package initially separated from its goal.** No plan solves that initial layout. The code
+  returns `h = 0` for every query on this instance. This also lower-bounds the cost from a different
+  layout of that instance, even when that layout has a solution.
 
-## 10. Assembly
+## 10. Rounding a lower bound
 
-Let L be the cost of the LOADs and UNLOADs of the plan and M the cost of all other actions.
+If x ≤ m and m is an integer, then ceil(x) ≤ m. This applies to each fractional movement bound
+when its budget is the doubled cost of specified actions and half-sails. It applies to the final
+regional division by two when the budget counts whole actions in ordinary cost units. Section
+14.3 gives the specific integer budget at each rounding step.
 
-- `L >= base + (LOAD/UNLOAD part of xfer)` by sections 3 and 8.
-- `M >= T2 / 2 + (crossing part of xfer)`: the road-bridge, port-bridge, first-entry and non-bridge terms
-  are lower bounds on pairwise disjoint sets of movement actions and half-sails (table in section 2),
-  the crossing part of `xfer` is an excess over the bridge terms on bridges no other excess uses, and the
-  additivity principle applies. Regions add because they share nothing.
+## 11. Historical validation
 
-`L + M` is an integer and `base`, `xfer` are integers, so `L + M >= base + ceil(T2 / 2) + xfer = h`.
-This holds for every plan, hence for the cheapest one: `h <= h*`.
-On a goal state nothing is undelivered, so every term is 0.
-
-`h` is an integer by construction. `h >= 0`: the only terms that could be negative are differences of two
-`_crossings` values (`first_in` and `first_out`. The others, `exo`, `exi` and `road11`, are non-negative
-by the remark in section 4). Each of them subtracts `g(v,0,0)` of one road bridge and adds at least 0, each bridge enters at most one
-such difference (`used` marks, disjoint private bridges, one side per bridge in section 7), and that
-`g(v,0,0)` is itself part of `T2 / 2`. So the sum is at least `base >= 0`. ∎
-
-## 11. What this proof does and does not establish
-
-It proves that the **bound described here** is admissible. That `ex1.py` computes exactly this bound
-(bit packing, bridge detection, prefix sums, caches and memo keys) is an implementation question, and the
-evidence for it is the exhaustive test, not this text:
+These runs were reported for earlier revisions. The integer-domain proof uses the plan inequalities
+and implementation invariants in sections 3–8, 13 and 14. The runs are independent empirical evidence.
 
 - 2,223 solvable random games, the whole reachable state space enumerated with an independent
   implementation of the rules, exact `h*` for every state: `h <= h*` on 16.5 million world states and on
-  21.1 million successor-reachable states, zero violations. (Re-run on this version of the code.)
+  21.1 million successor-reachable states, zero violations.
 - 515 more solvable games with inputs outside the assignment's wording (ferry starting at a port it does
   not serve, ferry for 0 trucks, truck of capacity 0): the same checks on 2.9 million world states, zero
   violations. 683 unsolvable games in total: no plan returned, no crash.
@@ -426,7 +468,7 @@ evidence for it is the exhaustive test, not this text:
   solved three ways (submitted configuration, heuristic without the first-entry and merge terms, all
   pruning rules off). Every pair of results that finished agrees on the cost: 402 of 402 for the weaker
   heuristic, 390 of 390 for no pruning.
-- The cached values go through the same check, so a wrong memo key would show as a violation.
+- Cached values were also evaluated. An incorrect collision that only lowers a value can pass an admissibility check.
 - On the real problems (p1, p3, x1..x8, y1): no violation on the states of the optimal plans or on about
   320 random reachable states.
 
@@ -464,7 +506,7 @@ problems, and equal to the cost found with all pruning off on 390 larger games) 
 
 ## 13. Revision 4: stronger bounds and cached evaluation (2026-11-16)
 
-The implementation now uses the formula below; this supersedes the assembly formula in section 2.
+For states that pass the checks in §0.2, the implementation uses the following formula.
 The original lemmas about road cuts, port cuts, pieces, first entry and merging still apply.
 
 ```
@@ -585,4 +627,192 @@ is 5 (two LOADs, one DRIVE, two UNLOADs). Revision 4 returned `h = 6`.
 The code now has the condition `w > 0`, as section 13.1 states. On the 18 given problems the heuristic
 value of every evaluated state, the number of expansions and the plan cost are unchanged. The random
 validation games have no zero-weight packages, which is why the earlier runs did not show this. The
-counterexample should be added to the edge-case script as a regression case.
+counterexample is covered by the `two weightless packages on cycle` case in `util/edge.py`.
+
+## 14. Adversarial check against the course definition
+
+The course quantifies over every state and compares against the minimum cost of a legal path to
+any goal. A single state and a cheaper legal completion refute admissibility. To prove it, fix
+an arbitrary state and completion and bound what that completion actually pays. The course's
+Manhattan-distance proof uses this argument for a sum. The relaxation argument projects every
+real plan to a feasible relaxed one, and the maximum rule combines lower bounds on a common cost.
+These arguments appear in *Informed Search*, printed slides 6 and 8 (PDF pages 9, 11 and 20),
+*heuristic_search*, slides 29 and 34, and *Heuristics_and_task_representation*, PDF pages 45–46.
+
+### 14.1 Decimal-capacity regression and its repair
+
+Use the following input, with no pruning or search assumptions.
+
+```python
+game = {
+    "Locations": 6,
+    "Roads": {(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0)},
+    "Ports": set(),
+    "Trucks": {10: (0, 1.3)},
+    "Ferries": {},
+    "Packages": {30: (0, 1, 3)},
+}
+
+from ex1 import LogisticsProblem
+from search import Node
+
+problem = LogisticsProblem(game)
+h = problem.h_astar(Node(problem.initial))
+assert type(h) is int and h == 5
+```
+
+At least one LOAD and one UNLOAD are necessary. While carried, the package must traverse at least
+three road edges to reach the opposite vertex. Loading at 0, driving 0–1–2–3, and unloading at 3
+attains this bound. Thus **h*(start) = 5**.
+
+The cycle has no bridges. The only movement term is the fractional distance. Before revision 7
+the exclusive package was assigned fractional weight C = 1.3. In exact real arithmetic,
+the doubled fraction would be `2 * (6*C) / (2*C) = 6`. In that Python evaluation,
+`den = 2.6` and `psi_r = psi_a = 7.800000000000001`. For the exact binary values stored in
+those variables, `2*psi_r - 6*den = 2**-50 > 0` (the subtraction here denotes exact rational
+arithmetic). Consequently the inner ceiling returned 7, the outer rounding charged 4 drives,
+and the previous implementation returned **6.0 > 5**. Revision 7 uses projected capacity 1
+by §0.1. Now `psi = 6`, `den = 2`, and the doubled movement bound is exactly 6.
+The returned value is **2 + 3 = 5**. The reference plan and its lower bound are independent
+of either numerical evaluation.
+
+### 14.2 Why the integer code computes the quantities used in the proof
+
+* **Region and dock checks.** The unions in `_build_regions` join every road and every edge
+  between a ferry and a port it serves or its initial dock. Each component containing a goal has
+  its own rank. All remaining components share one unused rank. When the graph is disconnected,
+  `_bound` checks that each truck's current node has its assigned rank and that each package's
+  physical node has its goal's rank. With one component both properties are automatic.
+  The check against `abnode[f]` ensures every current dock is represented. These facts persist
+  along any completion. A SAIL targets a served port, BOARD and DISEMBARK then follow existing
+  edges, and packages change graph node only with their truck. Thus every goal component has
+  exactly the truck fleet and capacities used by its bound for the entire completion. Trucks
+  in components without goals cannot contribute to it. This argument needs no path from the
+  designated initial layout to the state under evaluation.
+* **Bridges and pieces.** In `_bridges`, the DFS frame
+  keeps the next unexplored edge. On exit from vertex x, `low[x]` is the minimum discovery time
+  reachable down its DFS subtree followed by at most one non-parent back edge. Scanning a visited
+  neighbour and propagating a completed child's low value give this invariant by induction.
+  Thus the edge from parent a to x is a bridge exactly when `low[x] > disc[a]`: precisely then
+  the subtree has no alternate edge back to a or its ancestors. Flood fill ignoring those bridges
+  gives the contracted tree. For each non-bridge port edge the location endpoint belongs to a
+  unique connected set of non-bridge roads. Removing all its non-bridge port edges and flooding
+  from that endpoint computes exactly the side S of §5. The masks may overlap on vertices,
+  while each indexed port edge belongs to exactly one bridge or piece.
+* **Packed cuts.** A subtree occupies the DFS interval `[tin, tout)`. For a package at component
+  a, goal b and their lowest common ancestor l, let I(x) indicate membership in that subtree.
+  Its outward and inward coefficients are `I(a)-I(l)` and `I(b)-I(l)`. Indeed I(l) is 1
+  exactly when both a and b are in the subtree. Thus each coefficient is 0 or 1 and counts
+  precisely the required direction. The three signed updates followed by the difference of
+  prefix sums implement these identities by integer linearity. Final weight fields are bounded
+  by total regional package weight and the big-count fields by the number of packages, both
+  strictly below the assigned field widths' respective powers of two. Each truck contributes its
+  unique higher bit once. Intermediate signed values can safely cancel before unpacking.
+  `_decode`, the port-side orientation reversal, and the side masks therefore recover the
+  actual cut counts and truck lists.
+* **Port counts and fractional distances.** For a port bridge the dock test selects its ferry
+  at its one port. For pieces, `dockpiece` maps a (ferry, dock) pair to its unique piece.
+  Intersecting current and goal side masks gives the outgoing and incoming package sets.
+  A truck aboard a selected ferry is on the outside of the cut. Splitting its cargo by goal
+  membership gives exactly `wn, bn` and the per-truck outward cargo of §5. Omitting an inactive
+  term supplies the lower bound zero. For distances let L be the LCM of the ferry capacities
+  after replacing zero by one. The code scales edge lengths by 2L, so every half-sail share
+  `3*L/k` is integral. Repeated relaxation from the goal assigns lengths of actual walks,
+  and at termination no edge can shorten a label. Applying the edge inequalities along a
+  shortest path gives the reverse inequality, hence exact distances. Termination follows
+  from finitely many vertices, nonnegative integer labels, and strict improvement of a finite
+  label. Infinity is only the initial sentinel. A disconnected vertex stored with weight zero
+  weakens the estimate. Dividing by `2*C*L` and taking ceilings uses exact integer arithmetic.
+* **Flow recurrence.** For a road cut, k from 0 to T gives every difference d from minus the
+  number of outside trucks to the number of inside trucks. Thus `min(costs)` in `_flow_cost`
+  equals the unconditional crossing minimum in §4, even with unequal capacities. For a subtree c
+  let q_c(j) be its parent-cut excess with exactly j final trucks inside. If D_c(j) is the
+  minimum over all its descendant cuts with at most j trucks available, then its cost for a parent budget k
+  is `min_{0 <= j <= k}(q_c(j) + D_c(j))`. The j trucks can occupy the child subtrees or c
+  itself. A leaf has D_c = 0. Combining children partitions the budget by the minimum convolution
+  in `_flow`. Induction up to the root proves the returned entry is a minimum over a set containing
+  the final positions of every real plan. It lower-bounds the excess due to crossings alone.
+* **Caches and omissions.** In §§7–8 a goal with no common unreserved bridge contributes zero.
+  A first-entry value at most zero can be discarded because the unaugmented bridge bound already
+  holds. An early exit upon finding a zero candidate adds no positive claim. In §13.4 the key
+  of `_merge_struct` fixes the goal, prior reservations and package groups. Its inner key contains
+  all road values and port bounds on the chain and the lying groups' private bridges, the only
+  quantities `_merge_goal` reads. The outer heuristic caches project away focus and ferry
+  freshness, which no term reads. A multi-region key lists all local trucks, ferries and packages.
+  In the single-region key, collapsing custody for a standing package at a non-merge goal preserves
+  its physical and goal nodes and all cargo-at-sea data. The LOAD/UNLOAD base is computed before
+  this cache lookup. Together with the mask and vector keys in §13.4 these are value-preserving
+  projections for a fixed instance and fixed switches.
+
+### 14.3 One cost inequality for the exact return expression
+
+Fix any finite legal completion and a region with pending packages. Use ordinary action-cost units
+for the following counts:
+
+| Symbol | Meaning for this completion |
+| --- | --- |
+| H, b | Actual LOAD/UNLOAD count and the base handling bound from §3 |
+| T, Q | Actual number of road/port bridge crossings and the sum of their unconditional crossing bounds, excluding sails |
+| R, P | Actual non-bridge DRIVEs and non-bridge BOARDs/DISEMBARKs |
+| S | Actual number of sails, costing 3 each |
+
+Define the nonnegative integer `E = (H-b) + (T-Q)`. Sections 7–8 imply
+`merge + first_entry <= E`: distinct goals use distinct packages and reserve disjoint bridges,
+and the first-entry term uses only unreserved road bridges. Section 13.3 and the subtree induction
+above give `truck_flow_excess <= T-Q <= E`. Consequently their maximum X also satisfies `X <= E`.
+
+It remains to prove `B2 + N2 <= 2*(Q + R + P + 3*S)` for the two branches in §13.
+
+1. In the piece/road branch the doubled road fraction is at most 2R even after its ceiling,
+   because 2R is an integer. The pieces' crossing bounds total at most P. In each disjoint ferry
+   group g the bridge and piece half-sail bounds plus the balance correction sum to
+   `6*max(D_g,A_g)` in doubled units. Each actual sail has one departure and one arrival.
+   It witnesses at most one counted port set at each end, so this sum is at most six times
+   the group's actual sail count. Adding the groups and the doubled crossing baseline 2Q
+   gives the asserted inequality.
+2. In the all-fractions branch let v be the number of actual sail ends on port bridges.
+   Bridge half-sail bounds total at most 3v in doubled units. By the per-action charge in
+   §§6 and 13.1, the doubled all-fractions value is at most `2*R + 2*P + 3*(2*S-v)`.
+   The right side is an integer, so applying the ceiling preserves the inequality. Adding
+   2Q and the bridge half-sails proves the same bound. This branch receives no balance correction.
+
+Both alternatives satisfy the inequality, so their maximum does. Its right side is twice an
+integer, giving `ceil((B2+N2)/2) <= Q+R+P+3*S`. The exact regional contribution including handling
+therefore satisfies
+
+```text
+b + ceil((B2+N2)/2) + X
+    <= b + Q + R + P + 3*S + (H-b) + (T-Q)
+     = H + T + R + P + 3*S.
+```
+
+Every action belongs to one region. Summing this inequality and bounding a skipped region by
+zero proves `h(s) <= cost(plan)` for the arbitrary completion, hence `h(s) <= h*(s)`.
+All returned terms are integers. The doubled baseline is nonnegative and X is at least the
+nonnegative flow term (zero when there are no cuts). A goal has empty pending buckets and returns
+zero directly. If there is no completion the finite nonnegative result is bounded by infinity. ∎
+
+### 14.4 Counterexample to using the initial fleet without checking the current state
+
+Use locations 0, 1, 2, the sole road 0–1, and no ferries. A capacity-1 truck starts at 0 and a
+capacity-2 truck at the isolated location 2. Two unit packages lie at 0 with goal 1. From that
+initial layout the optimum is 7. The small truck must drive across twice and return once.
+
+Keep that same problem object and evaluate a world s with **both trucks at 0** and both packages
+still at 0. From s the larger truck can LOAD twice, DRIVE to 1 and UNLOAD twice, for cost 5.
+Every completion needs both LOADs, both UNLOADs and at least one DRIVE, so h*(s) = 5.
+Revision 7 returned 7 by using the original fleet of the 0–1 component. The state cannot be
+reached from the designated initial layout, so it refutes the broader all-layouts claim for
+that code. The current rank check returns 0. For every world actually reachable from the initial
+layout, the dock and rank conditions already follow from F1–F2 whenever the regional bound is used.
+
+### 14.5 Counterexample to adding the two excess bounds
+
+On the road 0–1–2–3 put one capacity-1 truck at 1 and two weight-1 packages travelling 0→3
+and 2→0. Every completion needs four handling actions and an empty first DRIVE to reach a package.
+The packages require at least three and two loaded DRIVEs respectively. Capacity 1 makes these
+five actions distinct. Picking up at 2, delivering at 0, then taking the other package from 0 to 3
+attains the lower bound of 10. The three unconditional road bounds are 2, 2, 1.
+The first-entry excess and the endpoint-flow excess are each 1. Adding them would yield 11
+on this legal integer input. The actual maximum yields 10. This example identifies the shared
+cost. The inequality above supplies the general justification.

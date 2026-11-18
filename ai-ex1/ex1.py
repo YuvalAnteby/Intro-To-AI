@@ -15,6 +15,7 @@
 # Codex:
 #   - Added truck-flow and whole-sail lower bounds, corridor and empty-ferry pruning, and caches.
 #   - Extended the proofs and regression checks and ran the independent validators and benchmarks.
+#   - Fixed decimal capacities and fractional cargo using an integer relaxation for the heuristic.
 #
 # No other online sources were used.
 
@@ -23,6 +24,7 @@ import search
 import utils
 
 from itertools import accumulate
+from math import ceil, floor
 from operator import itemgetter, sub
 
 id = ["212152896"]
@@ -105,11 +107,11 @@ class _Region:
         self.trucks = [t for t in range(pr.T) if pr.s0[1 + t] in nodeset]
         self.ntrucks = len(self.trucks)
         self.pkgs = [p for p in range(pr.P) if pr.pgoal[p] in nodeset]
-        caps = [pr.tcap[t] for t in self.trucks]
+        caps = [pr.bound_caps[t] for t in self.trucks]
         self.caps = caps
         self.cmax = max(max(caps), 1) if caps else 1
         cm = self.cmax
-        self.pbig = {p: (1 if 2 * pr.pw[p] > cm else 0) for p in self.pkgs}
+        self.pbig = {p: (1 if 2 * pr.bound_weights[p] > cm else 0) for p in self.pkgs}
 
         # ---- edges of the auxiliary graph: (u, v, ferry or -1)
         edges = []
@@ -262,7 +264,7 @@ class _Region:
         self.rmask = {x: rootmask[cc[x]] for x in nodes}
 
         # ---- packed fields of a cut value: weight out, weight in, big packages out, big in, trucks inside
-        total_w = sum(pr.pw[p] for p in self.pkgs) + 1
+        total_w = sum(pr.bound_weights[p] for p in self.pkgs) + 1
         self.WB = WB = total_w.bit_length() + 1
         self.BB = BB = (len(self.pkgs) + 1).bit_length() + 1
         self.WM = (1 << WB) - 1
@@ -409,7 +411,7 @@ class _Region:
         a, g = cc[x], cc[self.pr.pgoal[p]]
         if a == g:
             return ()
-        w = self.pr.pw[p]
+        w = self.pr.bound_weights[p]
         big = self.pbig[p]
         out = w + (big << (2 * self.WB))
         inn = (w << self.WB) + (big << (2 * self.WB + self.BB))
@@ -683,7 +685,7 @@ class _Region:
         if self.ncut > R:
             pres = {}
             WB, BB, WM, BM = self.WB, self.BB, self.WM, self.BM
-            pw = pr.pw
+            pw = pr.bound_weights
             pbig = self.pbig
             for i in range(R, self.ncut):
                 v = cv[i]
@@ -741,7 +743,7 @@ class _Region:
         piece2 = 0
         Q = self.npiece
         if Q:
-            pw = pr.pw
+            pw = pr.bound_weights
             pbig = self.pbig
             pm = self.pmask
             pgm = self.pgmask
@@ -1077,13 +1079,25 @@ class LogisticsProblem(search.Problem):
 
         self.tcap = [game["Trucks"][t][1] for t in tids]
         self.fports = [tuple(sorted(set(game["Ferries"][f][1]))) for f in fids]
-        self.fk = [game["Ferries"][f][2] for f in fids]
+        self.fk = [ceil(game["Ferries"][f][2]) for f in fids]
         # for the map graph: a ferry can also be boarded at the port where it starts, served or not
         self.gports = [tuple(sorted(set(self.fports[i]) | {game["Ferries"][f][0]})) for i, f in enumerate(fids)]
         classes = {}
-        self.fcls = [classes.setdefault((self.fports[i], self.fk[i]), len(classes)) for i in range(F)]
+        self.fcls = [classes.setdefault((self.fports[i], self.gports[i], self.fk[i]), len(classes))
+                     for i in range(F)]
         self.pw = [game["Packages"][p][1] for p in pids]
         self.pgoal = [game["Packages"][p][2] for p in pids]
+        self.integer_cargo = all(isinstance(w, int) and w >= 0 for w in self.pw)
+        self.package_order = range(P)
+        if self.integer_cargo:
+            # Integer cargo fits exactly when it fits the floored capacity.
+            self.tcap = [floor(c) for c in self.tcap]
+            self.bound_caps, self.bound_weights = self.tcap, self.pw
+        else:
+            # Any real load fits in this integer relaxation, even at a floating-point boundary.
+            self.bound_caps, self.bound_weights = [P] * T, [1] * P
+            index = {pid: p for p, pid in enumerate(pids)}
+            self.package_order = tuple(index[pid] for pid in game["Packages"])
 
         # focus codes
         self.FD0 = 1                        # truck t has just driven here from u
@@ -1117,7 +1131,10 @@ class LogisticsProblem(search.Problem):
             self.transfer_sites.update(ports)
         search.Problem.__init__(self, _State(self, self.s0))
         pclasses = {}
-        self.pcls = [pclasses.setdefault((self.pw[p], self.pgoal[p]), len(pclasses)) for p in range(P)]
+        self.pcls = []
+        for p in range(P):
+            key = (self.pw[p], self.pgoal[p]) if self.integer_cargo else p
+            self.pcls.append(pclasses.setdefault(key, len(pclasses)))
         self.npcls = len(pclasses) + 1
 
         self._build_regions()
@@ -1181,6 +1198,7 @@ class LogisticsProblem(search.Problem):
         members = {}
         for x in range(n + F):
             members.setdefault(find(x), []).append(x)
+        self.node_rank = [rank.get(find(x), big) for x in range(n + F)] if len(members) > 1 else ()
         self.regions = [_Region(self, members[c], i) for i, c in enumerate(order)]
 
     def _build_fractions(self):
@@ -1206,12 +1224,12 @@ class LogisticsProblem(search.Problem):
             while b:
                 a, b = b, a % b
             lk = lk * k // a
-        cmax = max(max(self.tcap), 1) if self.tcap else 1
+        cmax = max(max(self.bound_caps), 1) if self.bound_caps else 1
         self.den = 2 * cmax * lk
-        lightest = min((w for w in self.pw if w > 0), default=cmax)
+        lightest = min((w for w in self.bound_weights if w > 0), default=cmax)
         # A package that cannot share a truck with any other package of positive weight pays a whole
         # truck's movement cost. Packages of weight 0 can always share, so they keep weight 0.
-        self.frac_weight = [cmax if (w > 0 and w + lightest > cmax) else w for w in self.pw]
+        self.frac_weight = [cmax if (w > 0 and w + lightest > cmax) else w for w in self.bound_weights]
         bridge_road = set()
         bridge_port = set()
         for reg in self.regions:
@@ -1341,14 +1359,14 @@ class LogisticsProblem(search.Problem):
         pgoal = self.pgoal
         pw = self.pw
         tid = self.tids[t]
-        load = 0
         if cont:
             forced = -1
-            for p in cont:
-                load += pw[p]
-                if forced < 0 and pgoal[p] == l:
-                    forced = p
-            if forced >= 0 and OPT_FORCED:
+            if OPT_FORCED and self.integer_cargo:
+                for p in cont:
+                    if pgoal[p] == l:
+                        forced = p
+                        break
+            if forced >= 0:
                 ns = list(st)
                 ns[IP + forced] = l
                 ns[0] = 0
@@ -1356,11 +1374,11 @@ class LogisticsProblem(search.Problem):
                     self._finish(ns)
                 res.append(("UNLOAD{%d,%d}" % (self.pids[forced], tid), tuple(ns)))
                 return
-            if (kind != 2 or not OPT_ORDER) and (not OPT_CORRIDOR or l in self.transfer_sites):
+            if (kind != 2 or not OPT_ORDER or not self.integer_cargo) and (not OPT_CORRIDOR or l in self.transfer_sites):
                 seen = set()
                 for p in cont:
                     if OPT_TWINS:
-                        key = (pw[p], pgoal[p])
+                        key = self.pcls[p]
                         if key in seen:
                             continue
                         seen.add(key)
@@ -1372,17 +1390,18 @@ class LogisticsProblem(search.Problem):
                     res.append(("UNLOAD{%d,%d}" % (self.pids[p], tid), tuple(ns)))
         here = lying.get(l)
         if here:
-            room = self.tcap[t] - load
+            # Match World.load_of followed by World.load, including the package summation order.
+            load = sum(pw[p] for p in cont) if cont else 0
             seen = set()
             fl = self.FL0 + t * P
             for p in here:
                 w = pw[p]
                 if OPT_TWINS:
-                    key = (w, pgoal[p])
+                    key = self.pcls[p]
                     if key in seen:
                         continue
                     seen.add(key)
-                if w <= room:
+                if load + w <= self.tcap[t]:
                     ns = list(st)
                     ns[IP + p] = n + t
                     ns[0] = (fl + p) if (OPT_FOCUS and OPT_FL) else 0
@@ -1518,9 +1537,9 @@ class LogisticsProblem(search.Problem):
     def _successors(self, state):
         """The successors of the tuple of a state: [(action, tuple), ...]
 
-        Only legal actions are generated, and some legal actions are left out. Every rule below keeps at
-        least one optimal plan (each was also checked against an exhaustive search on thousands of small
-        random problems):
+        The rules below keep an optimal plan. With fractional or signed package weights the load test
+        follows the simulator's summation order, package identities remain distinct, and rules 1, 2
+        and 4 are disabled (see PRUNING_PROOF.md, section 11).
 
         1. Never load a package that lies at its goal (unloading it again would only cost more).
         2. Deliver packages at their goals immediately, globally when no truck has focus.
@@ -1571,10 +1590,12 @@ class LogisticsProblem(search.Problem):
         rank = self.ncomp
         last = 0
         prank = self.prank
-        for p in range(P):
+        for p in self.package_order:
             c = state[IP + p]
             if c < n:
                 if c == pgoal[p]:
+                    if not self.integer_cargo:
+                        lying.setdefault(c, []).append(p)
                     continue
                 if c in lying:
                     lying[c].append(p)
@@ -1627,7 +1648,7 @@ class LogisticsProblem(search.Problem):
             return res
         tcap = self.tcap
         trank = self.trank
-        if OPT_FORCED:
+        if OPT_FORCED and self.integer_cargo:
             for t, cargo in enumerate(inside):
                 if cargo and (not multi or trank[t] == rank):
                     loc = state[1 + t]
@@ -1692,7 +1713,7 @@ class LogisticsProblem(search.Problem):
         and returns a goal distance estimate"""
         state = node.state.s
         if self.dead:
-            return 0            # a package cannot reach its goal: there is no plan at all
+            return 0            # the initial layout has a package separated from its goal
         key = state[1:]
         h = self.hcache.get(key)
         if h is None:
@@ -1731,6 +1752,18 @@ class LogisticsProblem(search.Problem):
         n = self.n
         IP = self.IP
         pgoal = self.pgoal
+        # The precomputed bounds assume these docking edges and these regional truck fleets.
+        for f, docks in enumerate(self.abnode):
+            if state[self.IF + f] not in docks:
+                return 0
+        if self.node_rank:
+            for t, site in enumerate(tnode):
+                if self.node_rank[site] != self.trank[t]:
+                    return 0
+            for p, pos in enumerate(state[IP:]):
+                site = pos if pos < n else tnode[pos - n]
+                if self.node_rank[site] != self.prank[p]:
+                    return 0
         h = 0
         if self.ncomp == 1:
             bucket = []

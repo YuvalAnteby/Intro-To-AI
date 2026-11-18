@@ -290,5 +290,5 @@ Validation of the final algorithm:
   combine them with final verification.
 * `util/edge.py`: every listed edge case passed, including zero weights and zero ferry capacity.
 
-The pre-existing symmetry-proof caveat for ferries initially outside their served ports remains in
-section 9 of the pruning proof. Hidden grader cases have not been supplied.
+The later ferry-class change resolves the unserved-initial-dock caveat from this campaign. See
+Lemma 5 of the pruning proof. Hidden grader cases have not been supplied.

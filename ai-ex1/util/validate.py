@@ -173,6 +173,8 @@ class Ref:
         self.tids = sorted(game["Trucks"])
         self.fids = sorted(game["Ferries"])
         self.pids = sorted(game["Packages"])
+        package_index = {pid: i for i, pid in enumerate(self.pids)}
+        self.package_order = [package_index[pid] for pid in game["Packages"]]
         self.T, self.F, self.P = len(self.tids), len(self.fids), len(self.pids)
         adj = [set() for _ in range(n)]
         for a, b in game["Roads"]:
@@ -244,7 +246,7 @@ class Ref:
                 for b in self.adj[l]:
                     ns = list(s); ns[t] = b
                     out.append(("DRIVE{%d,%d,%d}" % (tid, l, b), 1, tuple(ns)))
-                load = sum(self.w[p] for p in range(P) if s[oP + p] == n + t)
+                load = sum(self.w[p] for p in self.package_order if s[oP + p] == n + t)
                 for p in range(P):
                     c = s[oP + p]
                     if c == l and load + self.w[p] <= self.cap[t]:

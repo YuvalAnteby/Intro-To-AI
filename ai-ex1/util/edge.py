@@ -21,6 +21,7 @@ G = {
  "truck in another part, unused": {"Locations": 4, "Roads": {(0,1)}, "Ports": set(), "Trucks": {10:(0,5), 11:(3,5)}, "Ferries": {}, "Packages": {30:(0,3,1)}},
  "roads as lists": {"Locations": 3, "Roads": [[0,1],[1,2]], "Ports": [], "Trucks": {10:(0,5)}, "Ferries": {}, "Packages": {30:(0,3,2)}},
  "zero weight package": {"Locations": 3, "Roads": {(0,1),(1,2)}, "Ports": set(), "Trucks": {10:(0,5)}, "Ferries": {}, "Packages": {30:(0,0,2), 31:(1,5,2)}},
+ "two weightless packages on cycle": {"Locations": 3, "Roads": {(0,1),(1,2),(2,0)}, "Ports": set(), "Trucks": {10:(0,1)}, "Ferries": {}, "Packages": {30:(2,5,2), 31:(0,0,1), 32:(0,0,1)}},
 }
 for name, g in G.items():
     try:

@@ -5,24 +5,32 @@ quantity that `h_astar` adds is defined here and proved to be a lower bound, inc
 from the previous version, which were re-derived from the assignment's rules and not assumed. No test
 result is used anywhere.
 
+Revision of 2026-11-19: the cache argument now proves preservation of a lower bound without assuming
+that a cache hit equals a fresh evaluation. The heuristic implementation is unchanged.
+
 ## 0. Results
 
-**Theorem 1 (admissibility).** For every state s, `h_astar` returns an integer h(s) with
+**Theorem 1 (admissibility).** For every legal state s reachable from the initial state, or obtained by
+the completed-region write-back described in Section 16, `h_astar` returns an integer h(s) with
 0 ≤ h(s) ≤ h\*(s), where h\*(s) is the cost of a cheapest plan from s (∞ if there is none). At a goal
-state h(s) = 0.
+state h(s) = 0. This holds for every cache history built from such states of the same problem instance;
+equality between the returned value and a fresh evaluation is not required.
 
-**Proposition 2 (comparison with the previous version).** For every state s, every term of the formula
-below is at least the corresponding term of the previous `ex1.py`, except the merge and first-entry term
-xfer, and h(s) ≥ h_old(s) whenever the previous value was decided by its flow term (Section 15).
+**Proposition 2 (comparison of fresh evaluations with the previous version).** For every state s in the
+scope of Theorem 1, every term of the fresh-evaluation formula below is at least the corresponding term
+of the previous `ex1.py`, except the merge and first-entry term xfer. Thus h_fresh(s) ≥ h_old,fresh(s)
+whenever the previous fresh value was decided by its flow term (Section 15). This comparison does not
+assert equality between a cached value and a fresh value.
 
 Neither result uses consistency, the successor function or its pruning. Theorem 1 bounds h by the
 optimal cost of the unpruned world. Pruning only removes options, so the optimal cost inside the pruned
 search graph is never smaller, and h is admissible for the search that `ex1.py` actually runs as well.
 
-**The formula.** For a state s,
+**The formula for a fresh evaluation.** Let h_fresh(s) be the value obtained by evaluating each region
+at s, without reusing `reg.cache`. Then
 
 ```
-h(s) = H(s) + Σ over regions R of  M_R(s)
+h_fresh(s) = H(s) + Σ over regions R of  M_R(s)
 M_R  = ⌈ T2 / 2 ⌉ + max( xfer, flow )
 T2   = 2·Σ_{road bridges e} g_e  +  Σ_{port bridges e} c2_e  +  Alt
 Alt  = max( piece2 + road2 + bal2 ,  frac2_all )      when the fractional tables are not all zero
@@ -34,15 +42,21 @@ Names ending in 2 are in doubled units (twice a cost), so that half-sails stay i
 g_e Lemma 2, c2_e and piece2 Lemma 5, bal2 Lemma 6, frac2_road and frac2_all Lemma 7, cyc2 Lemma 8,
 flow Lemma 9, and xfer Lemmas 10 and 11.
 
+A hit in the coarse, single-region `reg.cache` may reuse a cycle-center selection from another state
+with the same key. Section 16 proves that this preserves the bound on the same action costs, so the
+returned h(s) is admissible even when its equality to h_fresh(s) has not been established.
+
 ---
 
 ## 1. The model used in the proof
 
 An instance has locations 0, …, n−1, roads (unordered pairs {x, y} with x ≠ y), trucks, ferries and
 packages. Truck t has capacity c_t. Ferry f serves the port set L_f, carries at most k_f trucks and starts
-docked at d_f. Package p has weight w_p and goal g_p. The course staff stated that weights are integers
-≥ 1 and that every ferry starts at a port it serves. The proof only needs integer weights w_p ≥ 0 and
-integer capacities (Section 16 covers the code's relaxation for other inputs).
+docked at d_f. Package p has weight w_p and goal g_p. The supplied course-staff answer states w_p ≥ 1
+and that every ferry starts at a port it serves; it does not explicitly state that weights are integers.
+The core derivation below uses integer weights w_p ≥ 0 and integer capacities. Section 16 covers the
+code's relaxation for other numeric inputs, so the admissibility conclusion does not require an
+unconfirmed integrality assumption about the input weights or capacities.
 
 A state says, for every truck, whether it stands at a location or is aboard one ferry, for every ferry, the
 port where it is docked, and for every package, whether it lies at a location or is inside one truck.
@@ -640,7 +654,9 @@ xfer ≤ Σ*p ε_p + Σ*{bridges e} (A_e − base_e).
 
 ## 14. Proof of Theorem 1
 
-Fix the region R and the plan π. In the notation of the code:
+First consider a fresh regional evaluation. Fix the region R and the plan π. The argument permits any
+subset of cycle centers in each block (Lemma 8); it does not depend on the code's particular center
+selection. Exact helper-cache reuse is justified in Section 16. In the notation of the code:
 
 - base = Σ*{road bridges} g_e + Σ*{port bridges in pres} (boards*e + disemb_e). Since a processed port
   cut with c2 = 0 has boards = disemb = 0, T2 = 2·base + rest2 with
@@ -669,14 +685,20 @@ it is Lemma 9.
 **Conclusion.** The cost of R's actions is A*H + Σ*{bridges} A_e + N + 3·S, so by (i) to (iv) it is at
 least Σ_p h_p + base + extra + rest2 / 2. Every term except rest2 / 2 is an integer and the cost is an
 integer, so the cost is at least Σ_p h_p + base + extra + ⌈rest2 / 2⌉ = Σ_p h_p + ⌈T2 / 2⌉ + extra. Summing
-over the regions gives cost(π) ≥ h(s). Since π was arbitrary, h(s) ≤ h\*(s).
+over the regions gives cost(π) ≥ h_fresh(s). Since π was arbitrary, h_fresh(s) ≤ h\*(s).
 
-h(s) is an integer, and h(s) ≥ 0 because xfer ≥ 0 and flow ≥ 0. At a goal state no package is
-undelivered, so H = 0, every bucket is empty, and `_bound` returns 0. ∎
+Every fresh regional value is an integer and nonnegative: T2 ≥ 0, flow ≥ 0, and
+max(xfer, flow) ≥ 0. Lemma 13 in Section 16 proves that cache hits preserve the bound needed here,
+including the separation from compulsory handling H(s). Consequently the returned h(s) also satisfies
+0 ≤ h(s) ≤ h\*(s). At a goal state no package is undelivered, so H = 0, every bucket is empty, and
+`_bound` returns 0. ∎
 
 ---
 
 ## 15. Proof of Proposition 2 (comparison with the previous version)
+
+In this section h and h_old denote fresh evaluations, as specified in Proposition 2. They do not denote
+values imported from another state through the coarse regional cache.
 
 Write h = H + Σ_R ( ⌈rest2 / 2⌉ + max(base + xfer, base + flow) ), and the previous heuristic in the same
 form with rest2_old, base_old, xfer_old and flow_old. Below, rest2 ≥ rest2_old and
@@ -719,35 +741,102 @@ two results coincide. ∎
 
 ## 16. Implementation notes
 
-**Caches.** Every cache key determines every input of the cached value.
+**Cache obligation.** A cached value must remain a lower bound for the state in which it is reused.
+Most helper caches store a value determined exactly by their key. For the coarse, single-region
+`reg.cache`, a different argument is needed: reuse preserves admissibility even without establishing
+equality to a fresh evaluation. All caches belong to one fixed problem instance.
 
-- `hcache` (key: the state tuple): the bound is a function of the state. The former second cache
-  `hcache2` was removed. Its key only folded the truck codes n + 2f and n + 2f + 1 together, the successor
-  function never produces n + 2f, so it could not hit after a miss of `hcache`, and removing it does not
-  change any value.
-- `reg.cache`, one region: truck nodes, docks, and for every undelivered package its node, plus its holder
-  when that matters (a merge goal, or aboard a ferry for cargo and walk-in sums). Several regions: the raw
-  codes of the region's objects.
-- `ferry_cache`: for trucks and packages their port-cut and piece memberships (`port_site`), holders
-  aboard ferries, and the docks.
+**Keys used by the implementation.**
 
-**Why these two keys may ignore whether a package lies or is carried by a standing truck.** Take two
-states with the same key, and a package p that lies at location x in the first and is inside a standing
-truck t at x in the second. The key fixes t's node (for `reg.cache`), or t's side of every port cut and
-piece (for `ferry_cache`), so in both states t is on the same side as p of every cut that the cached value
-looks at, and in the second state t is at p's node. t can carry p, since c_t ≥ w_p holds for a truck that
-holds p in a reachable state. So in the first state p never makes a side lack a capable truck: it sets no
-bit of `vi`, `vo`, `qvi` or `qvo`, it never makes v_arr true, and in a cycle block it is in the same
-cluster as t, so it never raises the lying maximum above the capacity on its side. In the second state p
-does not lie and sets nothing either. The flags of all other packages are equal in both states, and every
-other ingredient of the value depends on nodes or sides, not on custody, except the merge groups and the
-cargo and walk-in sums aboard ferries, whose holders the keys keep. So both states have the same value.
-This keeps the reuse of a parent's value for its LOAD and UNLOAD children that the previous version had.
+- `hcache`: the complete raw state tuple. It stores an already obtained admissible answer for that same
+  state. The unused `hcache2` attribute is initialized but is not read or written by `h_astar` or `_h`.
+- `reg.cache`, one region: all truck nodes, all ferry docks, and, for every undelivered package, its ID
+  and node. It also retains the holder when the package is aboard a ferry or has a goal in `merge_goals`.
+  For multiple regions, `reg.sig(state)` instead retains the raw codes of that region's objects.
+- `ferry_cache`: each truck's port-cut and piece memberships, each truck's ferry index `tfer`, all ferry
+  docks, and each undelivered package's ID and memberships, retaining its holder when aboard a ferry.
 
-- The visit masks themselves are recomputed from the state at every evaluation and are not cached.
-- `road_extra_cache` (cut values, bucket, port bounds), `cyc_cache` (block, truck clusters, items),
-  `flow_cache` (the cost pattern), and the memo tables `gm`, `pcm`, `road0`, `exo`, `exi`, `first_in`,
-  `first_out`, `mcap`, `flow_cost`: pure functions of their keys.
+**Capability observation.** Let s and s' share a coarse regional key, and let p lie at x in one state
+and be carried by a standing truck t at x in the other. Since the carrying state is legal, c_t ≥ w_p
+(or the corresponding inequality in the integer relaxation). The key fixes t's node and p's node, so
+t is at x in both states. For any cut, including every cycle-ball cut, the side containing p therefore
+contains a truck capable of carrying p. Making p lying cannot set a visit flag that was previously
+false. Making it carried cannot remove a true visit flag caused by another package. If several packages
+change custody, apply this observation to each of them; no intermediate state needs to be constructed.
+Likewise p cannot force an arrival when its side already contains t. The same observation applies to
+two states sharing `ferry_cache`'s key for all of its port cuts and pieces: their precise locations may
+differ, but t and p remain on the same side of every relevant cut.
+
+**Exact reuse in `ferry_cache`.** Package crossing demands, truck membership masks, ferry occupancy and
+docks, and the per-truck walk-in and cargo sums are fixed by this key. The capability observation fixes
+the visit and arrival flags even where lying/carried status is omitted. Thus every input to the port
+bounds is the same, so the tuple `(port2, pres, piece2, sail_extra2)` is identical for states sharing
+this key. Ordinary reuse is exact here.
+
+**Why equality is not asserted for the coarse regional cache.** In `_cycle_bound`, a package is included
+in `items` when `a != b or hol < 0`, where a and b are its current and goal clusters. `_block_bound`
+chooses centers from the current clusters in `items`. Consequently, when a = b, changing a package from
+lying to carried can remove an item and can change the selected set of centers. Its visit contribution
+is redundant by the capability observation, but its presence as a possible center is a separate issue.
+The earlier argument that all inputs, and therefore fresh values, must be identical did not account
+for this selection rule. Equality is unnecessary for admissibility.
+
+**Lemma 13 (safe regional cache reuse).** Let s and s' be legal states in the scope of Theorem 1 with
+the same single-region cache key. If m is the regional value computed at s' and stored in `reg.cache`,
+then for every solution plan π from s,
+
+H_R(s) + m ≤ cost_R(π),
+
+where H*R(s) = Σ*{p in R} h_p(s), and cost_R counts only actions of that region.
+
+_Proof._ The key fixes all truck nodes, ferry docks, undelivered package IDs and package nodes. Hence
+the demands W_O, W_I, b_O and b_I and the truck membership masks are identical for every fixed cut.
+The capability observation also fixes its visit flags. It follows that the bridge values, port and
+piece bounds, sailing balance, truck-flow bound and global fractional bounds are unchanged. The merge
+groups are unchanged because the key retains holders for every merge goal. First-entry selection uses
+package nodes and goals, truck membership, and the reserved bridges, which are likewise unchanged.
+Thus xfer and flow are unchanged. These statements concern their values; some helper inputs, such as
+an unneeded holder field, may still differ.
+
+For a fixed cycle block B and any fixed center z, write
+
+b*B(z; s) = Σ*{r=1}^{ρ*z} g(X_r; s),
+f_B(s) = ⌈Σ*{p undelivered} cfw_p · dist_B(κ(node_p), κ(g_p)) / C⌉.
+
+Every fixed-center value b_B(z; s) equals b_B(z; s'): its demands, truck masks and visit flags have just
+been shown equal. Also f_B(s) = f_B(s') because nodes, goals and package IDs are fixed. A package omitted
+from `items` has a = b and is carried, so its distance and cut demands are zero and it sets no visit
+flag. If its custody changes under the shared key, its lying version still sets no visit flag by the
+capability observation. Omitting it therefore affects neither these fixed-center values nor f_B.
+
+Let Z'\_B be the centers actually selected when computing the stored value at s'. Lemmas 7a and 8 apply
+to any set of centers, including Z'\_B when the current state is s. Therefore
+
+max(f*B(s), max*{z in Z'\_B} b_B(z; s)) ≤ #(DRIVEs on B in π),
+
+with the maximum over an empty set taken as 0. If `items` was empty, f_B is also 0, matching the code's
+skipped block. This bound equals the block value used in m. Different blocks use disjoint road edges,
+so their cached block values can still be added. In particular, this reuses exactly the non-bridge-road
+cost account of Lemma 8; it does not charge compulsory handling or bridge costs.
+
+All other regional terms are unchanged, so Section 14's accounting applies at s with these reused
+cycle bounds. It gives H_R(s) + m ≤ cost_R(π). `_bound` recomputes H_R(s) from the current state, so it
+does not accidentally reuse H_R(s') when the package custody changes. ∎
+
+**Remaining caches and evaluation history.** The multiple-region `reg.cache` fixes the region's raw
+state and therefore gives exact reuse. `road_extra_cache` (cut values, bucket and port bounds),
+`cyc_cache` (block, truck clusters and complete `items`), `flow_cache` (cost pattern), and the scalar
+memo tables are determined by their keys and immutable instance data. The same holds for `flow_steps`
+and `flow_merges`, keyed by their input rows, and merge memoization, keyed by the goal, reserved bridges,
+group descriptions, and relevant cut and port values. Visit masks are computed when the corresponding
+calculation runs; a regional cache hit need not recompute them, because the argument above shows that
+their relevant truth values are preserved.
+
+Initially the caches are empty. On a miss, the bounds above justify the stored value. On a hit,
+exact reuse or Lemma 13 justifies the value for the receiving state. Induction over evaluations therefore
+establishes the invariant for every cache history. In particular `hcache` stores and reuses a valid
+answer for its exact state, even if the earlier regional center selection depended on evaluation order.
+This proves the cached part of Theorem 1 without asserting equality to h_fresh(s).
 
 **The component write-back.** When the successor function finishes a region it writes that region's trucks
 and ferries back to their initial positions. The region then has no undelivered package and contributes 0,
@@ -785,8 +874,9 @@ a valid lower bound.
 
 The parts inherited from the previous version (bridge and port bounds, cargo subsets, departures and
 arrivals, balance, fractions, flow, merge, first entry) were re-derived above from the rules of the
-assignment and found sound. The only weakness found was the order dependence in item 3, which was safe
-but could lose value.
+assignment. The order dependence in item 3 was safe but could lose value. The separate gap in the
+regional-cache explanation is addressed by Lemma 13; no change to the implemented heuristic is needed
+for that argument.
 
 **Revision after timing (same day).** A first version of these changes was slower on the course checker
 than the previous heuristic. Four costs were removed without touching what is proved: the second
@@ -795,3 +885,10 @@ computed by a loop over every pair of lying package and cut (now a few whole-int
 package, Lemma 4), a cache key that separated lying from carried packages and so recomputed every LOAD and
 UNLOAD child (now the previous key, justified in Section 16), and ball families around every cluster of a
 cycle block (now only around clusters where a relevant package is, Section 10).
+
+**Proof correction (2026-11-19).** Section 16 now distinguishes exact helper-cache reuse from reuse of
+an admissible cycle-center selection through the coarse regional cache. The theorem and formula
+distinguish cached answers from fresh evaluations, and the comparison in Section 15 is stated for fresh
+evaluations. The domain statement now accurately records the staff's w_p ≥ 1 clarification without
+attributing an integer-weight guarantee to that answer. These are proof changes only; no test results
+or changes to `ex1.py` are used.

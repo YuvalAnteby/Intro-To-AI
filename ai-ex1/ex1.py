@@ -13,9 +13,9 @@
 # Astra:
 #   - reviewed those proofs and the test tools, and pointed out errors that were then corrected.
 # Codex:
-#   - Added truck-flow and whole-sail lower bounds, corridor and empty-ferry pruning, and caches.
+#   - Added truck-flow and whole-sail lower bounds, corridor pruning, and caches.
 #   - Extended the proofs and regression checks and ran the independent validators and benchmarks.
-#   - Fixed decimal capacities and fractional cargo using an integer relaxation for the heuristic.
+#   - Fixed numeric cargo and ferry bounds using integer relaxations and the checker's capacity tests.
 #
 # No other online sources were used.
 
@@ -24,27 +24,21 @@ import search
 import utils
 
 from itertools import accumulate
-from math import ceil, floor
 from operator import itemgetter, sub
 
 id = ["212152896"]
 
-# Pruning switches. All of them are True in the submitted version; they exist so that every rule
-# could be validated separately against an exhaustive search on small random problems.
-OPT_FOCUS = True      # normal form of commuting actions (see successor)
+# Pruning switches kept in the current version.
+# History-dependent pruning (focus/order/U-turn/fresh-board/forced post-sail BOARD) was removed: it can
+# destroy the optimal continuation of a retained state.
 OPT_TWINS = True      # symmetry between identical trucks / ferries / packages
 OPT_FORCED = True     # a truck standing at the goal of a package it carries may only unload it
-OPT_ORDER = True      # unloads before loads at a stop
 OPT_COMP = True       # independent parts of the map are solved one after the other
 OPT_SYM = True        # states that differ only by a renaming of identical objects are the same state
 OPT_DEAD = True       # never enter a dead end of the map where there is nothing to do
-OPT_UTURN = True      # remember where a driving truck came from and do not drive straight back
-OPT_FL = True         # after LOAD the same truck goes on
-OPT_FRESH = True      # a truck that boarded may not disembark before the ferry sails
-OPT_BARREN = True     # an empty truck does not drive into a part where it can neither load nor board
-OPT_FIRST = True      # heuristic: the first truck that enters a part without trucks brings nothing for it
+OPT_BARREN = False    # disabled pending a proof that does not rely on truck focus
+OPT_FIRST = True      # heuristic only: first-entry lower bound
 OPT_CORRIDOR = True   # transfers on empty road corridors can be moved to an endpoint
-OPT_LAZYSAIL = True   # an empty ferry waits until a truck is ready at its destination
 
 
 class _State(object):
@@ -52,7 +46,7 @@ class _State(object):
 
     Two states are equal if one becomes the other by renaming objects that are fully interchangeable
     (trucks with the same capacity, ferries of the same line and size, packages with the same weight and
-    goal). The search then expands only one of them. The key that is compared is built only when needed."""
+    goal). The search then expands only one of them. The key contains no action history."""
     __slots__ = ("s", "k", "pr")
 
     def __init__(self, pr, s):
@@ -1060,11 +1054,11 @@ class LogisticsProblem(search.Problem):
         T, F, P = len(tids), len(fids), len(pids)
         self.n, self.T, self.F, self.P = n, T, F, P
         self.tids, self.fids, self.pids = tids, fids, pids
-        # A state is a tuple: (focus, trucks..., ferries..., packages...)
-        #   truck:   location l, or n + 2f (aboard ferry f, boarded at this port), or n + 2f + 1 (aboard, has sailed)
+        # A state is a tuple: (0, trucks..., ferries..., packages...).
+        # The leading zero is kept for compatibility with the original tuple layout; successor generation
+        # no longer stores action history. A truck aboard ferry f is encoded as n + 2f + 1.
         #   ferry:   the port where it is docked
         #   package: location l, or n + t (inside truck t)
-        #   focus:   0, or the truck that has to act next (it has just driven or loaded, see successor)
         self.IF = 1 + T
         self.IP = 1 + T + F
 
@@ -1079,44 +1073,32 @@ class LogisticsProblem(search.Problem):
 
         self.tcap = [game["Trucks"][t][1] for t in tids]
         self.fports = [tuple(sorted(set(game["Ferries"][f][1]))) for f in fids]
-        self.fk = [ceil(game["Ferries"][f][2]) for f in fids]
+        self.fcap = [game["Ferries"][f][2] for f in fids]
+        # A ferry can never carry more than the fleet, regardless of its numeric BOARD predicate.
+        self.fk = [min(k, T) if type(k) is int else T for k in self.fcap]
         # for the map graph: a ferry can also be boarded at the port where it starts, served or not
         self.gports = [tuple(sorted(set(self.fports[i]) | {game["Ferries"][f][0]})) for i, f in enumerate(fids)]
         classes = {}
-        self.fcls = [classes.setdefault((self.fports[i], self.gports[i], self.fk[i]), len(classes))
-                     for i in range(F)]
+        self.fcls = []
+        for f, capacity in enumerate(self.fcap):
+            key = (self.fports[f], self.gports[f], self.fk[f]) if type(capacity) is int else f
+            self.fcls.append(classes.setdefault(key, len(classes)))
         self.pw = [game["Packages"][p][1] for p in pids]
         self.pgoal = [game["Packages"][p][2] for p in pids]
-        self.integer_cargo = all(isinstance(w, int) and w >= 0 for w in self.pw)
+        self.integer_cargo = (all(type(w) is int and w >= 0 for w in self.pw)
+                              and all(type(c) is int for c in self.tcap))
         self.package_order = range(P)
         if self.integer_cargo:
-            # Integer cargo fits exactly when it fits the floored capacity.
-            self.tcap = [floor(c) for c in self.tcap]
             self.bound_caps, self.bound_weights = self.tcap, self.pw
         else:
             # Any real load fits in this integer relaxation, even at a floating-point boundary.
             self.bound_caps, self.bound_weights = [P] * T, [1] * P
             index = {pid: p for p, pid in enumerate(pids)}
             self.package_order = tuple(index[pid] for pid in game["Packages"])
+        # Equal numeric values can implement different LOAD comparisons.
+        self.tcls = self.tcap if self.integer_cargo else range(T)
 
-        # focus codes
-        self.FD0 = 1                        # truck t has just driven here from u
-        self.FL0 = self.FD0 + T * n         # truck t has just loaded package p
-        self.FE0 = self.FL0 + T * P        # empty ferry f has arrived for its next boarding
-        size = self.FE0 + F
-        fkind = [0] * size
-        fa = [0] * size
-        fb = [0] * size
-        for t in range(T):
-            for u in range(n):
-                c = self.FD0 + t * n + u
-                fkind[c], fa[c], fb[c] = 1, t, u
-            for p in range(P):
-                c = self.FL0 + t * P + p
-                fkind[c], fa[c], fb[c] = 2, t, p
-        self.fkind, self.fa, self.fb = fkind, fa, fb
-        for f in range(F):
-            fkind[self.FE0 + f], fa[self.FE0 + f] = 3, f
+        # No action-history/focus codes are kept.
 
         state = [0]
         state += [game["Trucks"][t][0] for t in tids]
@@ -1152,7 +1134,7 @@ class LogisticsProblem(search.Problem):
         self.adj_go = [tuple(w for w in self.adj[l] if (l, w) not in dead_drive) for l in range(n)]
         # for an empty truck: (neighbour, far side mask or 0 if the road is not a bridge)
         far = {}
-        if OPT_BARREN and OPT_FOCUS:
+        if OPT_BARREN:
             for reg in self.regions:
                 far.update(reg.far)
         self.adj_far = [tuple((w, far.get((l, w), 0)) for w in self.adj_go[l]) for l in range(n)]
@@ -1349,8 +1331,8 @@ class LogisticsProblem(search.Problem):
         ns[0] = 0
         return ("SAIL{%d,%d,%d}" % (self.fids[f], a, b), tuple(ns))
 
-    def _truck_standing(self, st, t, l, kind, x, cont, lying, res):
-        """Actions of truck t standing at l. kind/x describe the focus (kind 0: t is not the focus truck)."""
+    def _truck_standing(self, st, t, l, cont, lying, res):
+        """World-legal actions of truck t while it is standing at location l."""
         n = self.n
         T = self.T
         P = self.P
@@ -1374,7 +1356,7 @@ class LogisticsProblem(search.Problem):
                     self._finish(ns)
                 res.append(("UNLOAD{%d,%d}" % (self.pids[forced], tid), tuple(ns)))
                 return
-            if (kind != 2 or not OPT_ORDER or not self.integer_cargo) and (not OPT_CORRIDOR or l in self.transfer_sites):
+            if not OPT_CORRIDOR or l in self.transfer_sites:
                 seen = set()
                 for p in cont:
                     if OPT_TWINS:
@@ -1393,7 +1375,6 @@ class LogisticsProblem(search.Problem):
             # Match World.load_of followed by World.load, including the package summation order.
             load = sum(pw[p] for p in cont) if cont else 0
             seen = set()
-            fl = self.FL0 + t * P
             for p in here:
                 w = pw[p]
                 if OPT_TWINS:
@@ -1404,26 +1385,22 @@ class LogisticsProblem(search.Problem):
                 if load + w <= self.tcap[t]:
                     ns = list(st)
                     ns[IP + p] = n + t
-                    ns[0] = (fl + p) if (OPT_FOCUS and OPT_FL) else 0
+                    ns[0] = 0
                     res.append(("LOAD{%d,%d}" % (self.pids[p], tid), tuple(ns)))
-        back = x if kind == 1 else -1
-        fd = (self.FD0 + t * n + l) if OPT_FOCUS else 0
         if cont:
             for w in self.adj_go[l]:
-                if w != back:
-                    ns = list(st)
-                    ns[1 + t] = w
-                    ns[0] = fd if OPT_UTURN else (self.FD0 + t * n + w)
-                    res.append(("DRIVE{%d,%d,%d}" % (tid, l, w), tuple(ns)))
+                ns = list(st)
+                ns[1 + t] = w
+                ns[0] = 0
+                res.append(("DRIVE{%d,%d,%d}" % (tid, l, w), tuple(ns)))
         else:
-            # an empty truck drives until it loads or boards (nothing else happens in between), so it does
-            # not cross a bridge to a side where no package lies and no ferry is docked
+            # OPT_BARREN is currently disabled. The code path remains available for a future proof.
             useful = self._useful
             for w, far in self.adj_far[l]:
-                if w != back and (not far or far & useful):
+                if not far or far & useful:
                     ns = list(st)
                     ns[1 + t] = w
-                    ns[0] = fd if OPT_UTURN else (self.FD0 + t * n + w)
+                    ns[0] = 0
                     res.append(("DRIVE{%d,%d,%d}" % (tid, l, w), tuple(ns)))
         F = self.F
         if F:
@@ -1438,7 +1415,7 @@ class LogisticsProblem(search.Problem):
                     c = st[t2]
                     if c == code0 or c == code0 + 1:
                         cnt += 1
-                if cnt >= self.fk[f]:
+                if not (cnt < self.fcap[f]):
                     continue
                 if cnt == 0 and OPT_TWINS:
                     key = self.fcls[f]
@@ -1448,7 +1425,7 @@ class LogisticsProblem(search.Problem):
                         continue
                     seen.add(key)
                 ns = list(st)
-                ns[1 + t] = code0 if OPT_FRESH else code0 + 1
+                ns[1 + t] = code0 + 1
                 ns[0] = 0
                 res.append(("BOARD{%d,%d}" % (tid, self.fids[f]), tuple(ns)))
 
@@ -1477,9 +1454,6 @@ class LogisticsProblem(search.Problem):
         T = self.T
         IF = self.IF
         IP = self.IP
-        foc = s[0]
-        kind = self.fkind[foc]
-        who = self.fa[foc]
         npc = self.npcls
         pcls = self.pcls
         cont = [None] * T
@@ -1495,7 +1469,7 @@ class LogisticsProblem(search.Problem):
         lying.sort()
         standing = []
         aboard = None
-        tcap = self.tcap
+        tcls = self.tcls
         for t in range(T):
             c = cont[t]
             if c is None:
@@ -1503,20 +1477,14 @@ class LogisticsProblem(search.Problem):
             else:
                 c.sort()
                 c = tuple(c)
-            flag = 0
-            if who == t:
-                if kind == 1:
-                    flag = 2 + self.fb[foc]     # has just driven here from fb
-                elif kind == 2:
-                    flag = 1                    # has just loaded
             tc = s[1 + t]
             if tc < n:
-                standing.append((tc, tcap[t], flag, c))
+                standing.append((tc, tcls[t], c))
             else:
                 if aboard is None:
                     aboard = {}
                 f = (tc - n) >> 1
-                d = ((tc - n) & 1, tcap[t], c)
+                d = (tcls[t], c)
                 if f in aboard:
                     aboard[f].append(d)
                 else:
@@ -1528,40 +1496,26 @@ class LogisticsProblem(search.Problem):
             if aboard is not None and f in aboard:
                 a = aboard[f]
                 a.sort()
-                ferries.append((fcls[f], s[IF + f], tuple(a), int(kind == 3 and who == f)))
+                ferries.append((fcls[f], s[IF + f], tuple(a)))
             else:
-                ferries.append((fcls[f], s[IF + f], (), int(kind == 3 and who == f)))
+                ferries.append((fcls[f], s[IF + f], ()))
         ferries.sort()
         return (tuple(standing), tuple(ferries), tuple(lying))
 
     def _successors(self, state):
         """The successors of the tuple of a state: [(action, tuple), ...]
 
-        The rules below keep an optimal plan. With fractional or signed package weights the load test
-        follows the simulator's summation order, package identities remain distinct, and rules 1, 2
-        and 4 are disabled (see PRUNING_PROOF.md, section 11).
+        Current pruning rules:
+        1. Never load a package that already lies at its goal.
+        2. If a standing truck carries a package for its current location, unload a canonical such package now.
+        3. Use one representative among truly interchangeable packages/trucks/ferries.
+        4. Do not enter precomputed dead map sides / dominated ports.
+        5. Solve independent map components in a canonical component order.
+        6. Transfers on empty degree-two road corridors are restricted to corridor endpoints.
 
-        1. Never load a package that lies at its goal (unloading it again would only cost more).
-        2. Deliver packages at their goals immediately, globally when no truck has focus.
-        3. Identical objects in an identical situation (two empty trucks with the same capacity at the same
-           place, two packages with the same weight and goal at the same place, two empty ferries of the same
-           line at the same port): only the one with the lowest index may be used first.
-        4. At a stop a truck unloads before it loads.
-        5. Normal form of commuting actions. An action of a truck and a later action of another truck (or
-           ferry) that touch different things can be swapped without changing the result. So a DRIVE or a
-           LOAD of truck t can always be moved later, to just before the next action of t. Therefore:
-             - after DRIVE or LOAD of truck t the next action is again an action of t (focus on t);
-             - a truck that has just driven does not drive straight back;
-             - a truck does not board and disembark without a sail in between;
-             - an empty truck does not cross a bridge to a side where no package lies and no ferry is
-               docked (it drives without interruption until it loads or boards, and it could not).
-        6. Never enter a dead end of the map (a side of a bridge where no package starts or has to go and
-           no truck starts), and never sail to a port with nothing on its island if another port serves
-           the same ferries: whatever a plan does there can be done elsewhere for the same cost or less.
-        7. States that differ only by a renaming of interchangeable objects are one state (class _State).
-        8. Independent parts of the map are solved one after the other.
-        9. Move transfers on empty degree-two road corridors to their endpoints.
-        10. An empty ferry sails immediately before a BOARD; this pair may continue truck focus."""
+        History-dependent pruning was removed. In particular, there is no truck focus, no post-LOAD order
+        restriction, no U-turn ban, no fresh-board restriction, and no forced BOARD after an empty sail.
+        OPT_BARREN is disabled until it has a proof that does not rely on focus."""
         n = self.n
         T = self.T
         F = self.F
@@ -1569,20 +1523,8 @@ class LogisticsProblem(search.Problem):
         IF = self.IF
         IP = self.IP
         pgoal = self.pgoal
-        foc = state[0]
-        kind = self.fkind[foc]
         res = []
         if self.dead:
-            return res
-        if kind == 3:
-            f = self.fa[foc]
-            if self.fk[f] > 0:
-                for t in range(T):
-                    if state[1 + t] == state[IF + f]:
-                        ns = list(state)
-                        ns[1 + t] = n + 2 * f + (0 if OPT_FRESH else 1)
-                        ns[0] = 0
-                        res.append(("BOARD{%d,%d}" % (self.tids[t], self.fids[f]), tuple(ns)))
             return res
 
         inside = [None] * T
@@ -1625,35 +1567,19 @@ class LogisticsProblem(search.Problem):
                 useful |= 1 << state[IF + f]
         self._useful = useful
 
-        standing = set()
         aboard_count = [0] * F
         for tc in state[1:1 + T]:
-            if tc < n:
-                standing.add(tc)
-            else:
+            if tc >= n:
                 aboard_count[(tc - n) >> 1] += 1
 
-        if kind == 1 or kind == 2:
-            t = self.fa[foc]
-            self._truck_standing(state, t, state[1 + t], kind, self.fb[foc], inside[t], lying, res)
-            if OPT_LAZYSAIL:
-                loc = state[1 + t]
-                for f in range(F):
-                    port = state[IF + f]
-                    if self.fk[f] > 0 and not aboard_count[f] and port != loc and loc in self.sail_to[f]:
-                        action, ns = self._sail(state, f, port, loc)
-                        ns = list(ns)
-                        ns[0] = self.FE0 + f
-                        res.append((action, tuple(ns)))
-            return res
-        tcap = self.tcap
+        tcls = self.tcls
         trank = self.trank
         if OPT_FORCED and self.integer_cargo:
             for t, cargo in enumerate(inside):
                 if cargo and (not multi or trank[t] == rank):
                     loc = state[1 + t]
                     if loc < n and any(pgoal[p] == loc for p in cargo):
-                        self._truck_standing(state, t, loc, 0, -1, cargo, lying, res)
+                        self._truck_standing(state, t, loc, cargo, lying, res)
                         return res
         seen_t = set()
         for t in range(T):
@@ -1662,13 +1588,13 @@ class LogisticsProblem(search.Problem):
             tc = state[1 + t]
             cont = inside[t]
             if not cont and OPT_TWINS:
-                key = (tc, tcap[t])
+                key = (tc, tcls[t])
                 if key in seen_t:
                     continue
                 seen_t.add(key)
             if tc < n:
-                self._truck_standing(state, t, tc, 0, -1, cont, lying, res)
-            elif (tc - n) & 1 or not OPT_FOCUS:
+                self._truck_standing(state, t, tc, cont, lying, res)
+            else:
                 f = (tc - n) >> 1
                 ns = list(state)
                 ns[1 + t] = state[IF + f]
@@ -1689,13 +1615,8 @@ class LogisticsProblem(search.Problem):
                             continue
                         seen_f.add(key)
                 for b in self.sail_to[f]:
-                    if b != port and (not OPT_LAZYSAIL or aboard_count[f] or b in standing):
-                        action, ns = self._sail(state, f, port, b)
-                        if OPT_LAZYSAIL and not aboard_count[f]:
-                            ns = list(ns)
-                            ns[0] = self.FE0 + f
-                            ns = tuple(ns)
-                        res.append((action, ns))
+                    if b != port:
+                        res.append(self._sail(state, f, port, b))
         return res
 
     def goal_test(self, state):

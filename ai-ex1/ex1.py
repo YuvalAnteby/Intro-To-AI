@@ -17,6 +17,13 @@
 #   - Extended the proofs and regression checks and ran the independent validators and benchmarks.
 #   - Fixed numeric cargo and ferry bounds using integer relaxations and the checker's capacity tests.
 #
+# Claude Opus 5.5:
+#   - Re-derived every part of the heuristic and wrote a complete formal admissibility proof
+#     (HEURISTIC_PROOF.md).
+#   - Added to the heuristic: capacity-aware visit requirements on every cut, lower bounds for road cycles
+#     (ball families and per-cycle fractions), and a stronger first-entry selection, then reduced their
+#     cost per state after the timings showed it. The successor function and its pruning were not changed.
+#
 # No other online sources were used.
 
 import ex1_check
@@ -279,8 +286,6 @@ class _Region:
         self.first_in = _Memo(self._first_in)
         self.first_out = _Memo(self._first_out)
         self.road_extra_cache = {}
-        self.TB = 1 << self.TSH
-        self.ALLB = ((1 << self.ntrucks) - 1) << self.TSH
         self.rroad = range(self.nroad)
         self.flow_cost = _Memo(self._flow_cost)
         self.port_flow_cost = _Memo(self._port_flow_cost)
@@ -290,6 +295,17 @@ class _Region:
         self.flow_zero = (0,) * (self.ntrucks + 1)
         self.flow_root = root
         self.flow_order = [(c, parent[c], index[c]) for c in reversed(order) if c != root]
+        # Two visit flags sit above the truck bits of a road-cut value (proof, Lemma 2(v)):
+        # VIB: a lying package inside cannot be loaded by any truck inside, so some truck must enter.
+        # VOB: the same for the outside, so some truck must leave.
+        self.TMASK = (1 << self.ntrucks) - 1
+        self.VSH = self.TSH + self.ntrucks
+        self.VIB = 1 << self.VSH
+        self.VOB = 1 << (self.VSH + 1)
+        self.ALLC = (1 << self.ncut) - 1        # every bridge cut, as bits over cut indices
+        self.ROADS = (1 << self.nroad) - 1      # the road-bridge cuts
+        # largest capacity among the region's trucks in a bit mask (-1 for no truck)
+        self.mcap = _Memo(lambda m: max((c for j, c in enumerate(caps) if (m >> j) & 1), default=-1))
 
         # ---- pieces: groups of locations inside a 2-edge-connected part that are joined by roads.
         # All the transport between a piece (with everything hanging on it) and the rest goes through
@@ -333,6 +349,7 @@ class _Region:
             self.piece_ferries.append([(f2, frozenset(ports)) for f2, ports in served.items()])
             q += 1
         self.npiece = q
+        self.ALLQ = (1 << q) - 1                # every piece, as bits over piece indices
         self.ferry_group = list(range(F))
         for ferries in self.piece_ferries:
             groups = {self.ferry_group[f] for f, _ in ferries}
@@ -344,6 +361,60 @@ class _Region:
         self.pgmask = {p: self.pmask[pr.pgoal[p]] for p in self.pkgs}
         self.NN = n + F + 1
         self.pcross = _Memo(self._piece_crossing)
+
+        # ---- cycle blocks (proof, Lemma 8): for every 2-edge-connected part, its road edges that are
+        # not bridges. Contracting everything else gives a small graph of "clusters"; balls around a
+        # cluster are cuts whose boundaries use only these edges and are pairwise disjoint.
+        nbroad = {}
+        for i, (u, v, f) in enumerate(edges):
+            if f < 0 and not isb[i]:
+                nbroad.setdefault(cc[u], []).append(i)
+        self.blocks = []
+        for c in sorted(nbroad):
+            eids = set(nbroad[c])
+            cl = {}
+            ncl = 0
+            for s in nodes:
+                if s in cl:
+                    continue
+                cl[s] = ncl
+                stack = [s]
+                while stack:
+                    x = stack.pop()
+                    for y, j in adj[x]:
+                        if j not in eids and y not in cl:
+                            cl[y] = ncl
+                            stack.append(y)
+                ncl += 1
+            qadj = [set() for _ in range(ncl)]
+            for j in eids:
+                a, b = cl[edges[j][0]], cl[edges[j][1]]
+                if a != b:
+                    qadj[a].add(b)
+                    qadj[b].add(a)
+            if not any(qadj):
+                continue
+            far = ncl + 1           # stands for "unreachable"; cannot occur in a connected region
+            dist = []
+            for z in range(ncl):
+                d = [far] * ncl
+                d[z] = 0
+                queue = [z]
+                for x in queue:
+                    for y in qadj[x]:
+                        if d[y] == far:
+                            d[y] = d[x] + 1
+                            queue.append(y)
+                dist.append(d)
+            radius = [max(x for x in d if x < far) for d in dist]
+            self.blocks.append((cl, dist, radius, far))
+        self.cyc_cache = {}
+        # fractional weights for the per-block fractional bound (proof, Lemma 7): a package that cannot
+        # share a truck with any other package of positive weight counts as a full truck
+        posw = [pr.bound_weights[p] for p in self.pkgs if pr.bound_weights[p] > 0]
+        light = min(posw) if posw else 0
+        self.cfw = {p: (cm if (pr.bound_weights[p] > 0 and pr.bound_weights[p] + light > cm)
+                        else pr.bound_weights[p]) for p in self.pkgs}
 
         # goals shared by several packages (candidates for the merge bound)
         count = {}
@@ -433,16 +504,19 @@ class _Region:
         r = self.gm.get(key)
         if r is not None:
             return r
-        wo, wi, bo, bi, cs, co = self._decode(v)
-        r = self.gm[key] = self._crossings(wo, wi, bo, bi, cs, co, a, b)
+        wo, wi, bo, bi, cs, co, vi, vo = self._decode(v)
+        r = self.gm[key] = self._crossings(wo, wi, bo, bi, cs, co, max(a, vo), max(b, vi))
         return r
 
     def _decode(self, v):
+        """Fields of a cut value: weight out, weight in, big out, big in, capacities of the trucks inside
+        and outside (largest first), and the two visit flags (some truck must enter / must leave)."""
         WB, BB = self.WB, self.BB
-        mask = v >> self.TSH
+        mask = (v >> self.TSH) & self.TMASK
         cs = sorted((c for j, c in enumerate(self.caps) if (mask >> j) & 1), reverse=True)
         co = sorted((c for j, c in enumerate(self.caps) if not (mask >> j) & 1), reverse=True)
-        return (v & self.WM, (v >> WB) & self.WM, (v >> (2 * WB)) & self.BM, (v >> (2 * WB + BB)) & self.BM, cs, co)
+        return (v & self.WM, (v >> WB) & self.WM, (v >> (2 * WB)) & self.BM, (v >> (2 * WB + BB)) & self.BM, cs, co,
+                (v >> self.VSH) & 1, (v >> (self.VSH + 1)) & 1)
 
     def _crossings(self, wo, wi, bo, bi, cs, co, a, b):
         """The least zo + zi (crossings out + in) with zo >= a, zi >= b that can carry the weight, exactly.
@@ -476,21 +550,22 @@ class _Region:
 
     def _first_in(self, v):
         """A side of a road bridge without trucks: extra crossings if the first truck that enters the subtree
-        brings nothing that has to go in. After this crossing there is one more truck inside."""
-        wo, wi, bo, bi, cs, co = self._decode(v)
+        brings nothing that has to go in. After this crossing there is one more truck inside.
+        The suffix bound ignores the visit flags, which only makes it smaller."""
+        wo, wi, bo, bi, cs, co, vi, vo = self._decode(v)
         return 1 + self._crossings(wo, wi, bo, bi, [self.cmax] + cs, co, 0, 0) - self.g(v, 0, 0)
 
     def _first_out(self, v):
         """The same for the side outside the subtree (all the trucks are inside the subtree)."""
-        wo, wi, bo, bi, cs, co = self._decode(v)
+        wo, wi, bo, bi, cs, co, vi, vo = self._decode(v)
         return 1 + self._crossings(wo, wi, bo, bi, cs, [self.cmax] + co, 0, 0) - self.g(v, 0, 0)
 
     def _flow_cost(self, v):
         """Excess road crossings for each possible number of trucks finishing beyond this bridge."""
-        wo, wi, bo, bi, cs, co = self._decode(v)
+        wo, wi, bo, bi, cs, co, vi, vo = self._decode(v)
         cm = self.cmax
-        a = max(bo, -(-wo // cm))
-        b = max(bi, -(-wi // cm))
+        a = max(bo, -(-wo // cm), vo)
+        b = max(bi, -(-wi // cm), vi)
         costs = []
         for k in range(self.ntrucks + 1):
             d = len(cs) - k
@@ -515,7 +590,7 @@ class _Region:
         for i in range(self.nroad, self.ncut):
             boards, disemb = pres.get(i, (0, 0))
             out, inn = (boards, disemb) if self.cut_port[i][2] else (disemb, boards)
-            pattern.append(self.port_flow_cost[((cv[i] >> self.TSH).bit_count(), out, inn)])
+            pattern.append(self.port_flow_cost[(((cv[i] >> self.TSH) & self.TMASK).bit_count(), out, inn)])
         pattern = tuple(pattern)
         result = self.flow_cache.get(pattern)
         if result is not None:
@@ -549,28 +624,31 @@ class _Region:
         return result
 
     # ------------------------------------------------------------------ ferries
-    def port_cost(self, wo, bo, wi, bi, wn, bn, cargo, ts, ndock, k, here, away):
+    def port_cost(self, wo, bo, wi, bi, wn, bn, cargo, ts, ndock, k, here, away, vin, varr, vout):
         """Lower bound on boards + disembarks + sails at a set S of ports (twice the cost, a sail is split
         into a departure and an arrival of 1.5 each), and the bounds on boards and disembarks alone.
         wo/wi: weight that has to leave / enter S (bo/bi: big packages); wn/bn: the part of wi that is aboard
         a ferry docked at S; cargo: [weight, big] of every truck aboard a docked ferry whose packages have to
         go elsewhere; ts: trucks in S; ndock: trucks aboard docked ferries; k: largest ferry;
-        here/away: ferries of S docked at S / elsewhere. Also returns the departure-minus-arrival bound."""
+        here/away: ferries of S docked at S / elsewhere. Visit flags (proof, Lemma 5(a)-(c)): vin, a truck
+        must enter S; varr, it must also arrive by sail; vout, a truck must leave S.
+        Also returns the departure-minus-arrival bound."""
         if not cargo:
-            key = (wo, bo, wi, bi, wn, bn, ts, ndock, k, here, away)
+            key = (wo, bo, wi, bi, wn, bn, ts, ndock, k, here, away, vin, varr, vout)
             r = self.pcm.get(key)
             if r is None:
-                r = self.pcm[key] = self._port_cost(wo, bo, wi, bi, wn, bn, None, ts, ndock, k, here, away)
+                r = self.pcm[key] = self._port_cost(wo, bo, wi, bi, wn, bn, None, ts, ndock, k, here, away,
+                                                    vin, varr, vout)
             return r
-        return self._port_cost(wo, bo, wi, bi, wn, bn, cargo, ts, ndock, k, here, away)
+        return self._port_cost(wo, bo, wi, bi, wn, bn, cargo, ts, ndock, k, here, away, vin, varr, vout)
 
-    def _port_cost(self, wo, bo, wi, bi, wn, bn, cargo, ts, ndock, k, here, away):
+    def _port_cost(self, wo, bo, wi, bi, wn, bn, cargo, ts, ndock, k, here, away, vin, varr, vout):
         cm = self.cmax
         mo = max(-(-wo // cm), bo)
         mi = max(-(-wi // cm), bi)
         to = self.ntrucks - ts
-        boards = max(mo, mi - to)
-        disemb = max(mi, mo - ts)
+        boards = max(mo, mi - to, vout)
+        disemb = max(mi, mo - ts, vin)
         if cargo:
             cw = 0
             cb = 0
@@ -598,6 +676,10 @@ class _Region:
         else:
             d0 = max(-(-mo // k), -(-(mi - to) // k), 0)
             need = mo - ts - ndock
+        if vout and d0 < 1:
+            d0 = 1
+        if varr and need < 1:
+            need = 1
         mf = max(-(-(wi - wn) // cm), bi - bn)
         a0 = max(-(-mf // k), -(-need // k), 0)
         dep = max(d0, a0 - away)
@@ -616,6 +698,9 @@ class _Region:
         xfer = 0
         cv = ()
         flow_extra = 0
+        # lying, undelivered packages: each one still needs a truck that is able to carry it (Lemma 2(v))
+        lying = [(p, site) for p, site, hol in bucket if hol < 0]
+        vi = vo = 0
         if self.ncut:
             vals = self.zero[:]
             upd = self.upd
@@ -629,16 +714,31 @@ class _Region:
             prefix = list(accumulate(vals))
             cv = list(map(sub, self.ighi(prefix), self.iglo(prefix)))
             R = self.nroad
+            if lying:
+                vi, vo = self._visit_masks(lying, tnode)
+                fl = (vi | vo) & self.ROADS
+                if fl:
+                    VIB, VOB = self.VIB, self.VOB
+                    while fl:
+                        low = fl & -fl
+                        i = low.bit_length() - 1
+                        fl ^= low
+                        if vi & low:
+                            cv[i] |= VIB
+                        if vo & low:
+                            cv[i] |= VOB
             if R:
                 total2 = 2 * sum(map(self.road0.__getitem__, cv[:R]))
         if pr.F:
-            port2, pres, piece2, sail_extra2 = self._ferry_bound(state, bucket, tnode, tfer, cv)
+            port2, pres, piece2, sail_extra2 = self._ferry_bound(state, bucket, tnode, tfer, cv, lying, vi, vo)
             total2 += port2
         else:
             pres, piece2, sail_extra2 = {}, 0, 0
         if self.ncut:
             flow_extra = self._flow(cv, pres)
-            xfer = self._road_extra(bucket, cv, pres)
+            xfer = self._road_extra(bucket, cv, pres, tnode)
+        # non-bridge road edges: ball families and per-block fractions (Lemmas 7 and 8), doubled
+        road_cyc2 = 2 * self._cycle_bound(bucket, tnode) if self.blocks else 0
 
         if pr.has_frac:
             psi_r = 0
@@ -653,15 +753,149 @@ class _Region:
                 psi_r += wr[p][site]
                 psi_a += wa[p][site]
             den = pr.den
-            alt_a = piece2 - (-(2 * psi_r) // den) + sail_extra2
+            road2 = -(-(2 * psi_r) // den)
+            if road_cyc2 > road2:
+                road2 = road_cyc2
+            alt_a = piece2 + road2 + sail_extra2
             alt_b = -(-(2 * psi_a) // den)
             total2 += alt_a if alt_a > alt_b else alt_b
         else:
-            total2 += piece2 + sail_extra2
+            total2 += piece2 + road_cyc2 + sail_extra2
         return (total2 + 1) // 2 + max(xfer, flow_extra)
 
-    def _ferry_bound(self, state, bucket, tnode, tfer, cv):
-        """Port and piece costs depend on island membership, not on drives within an island."""
+    def _visit_masks(self, lying, tnode):
+        """Visit flags of all bridge cuts at once, as bit masks over cut indices (proof, Lemma 4).
+        vi has bit i when the subtree of cut i holds a lying undelivered package that no truck in that subtree
+        is big enough to carry, vo the same for the other side of cut i. A truck with capacity >= w is
+        "capable" for weight w. cin: the cuts whose subtree holds a capable truck, cout: the cuts whose other
+        side holds one."""
+        rmask = self.rmask
+        ALL = self.ALLC
+        caps = self.caps
+        tm = [rmask[tnode[t]] for t in self.trucks]
+        pw = self.pr.bound_weights
+        vi = vo = 0
+        seen = {}
+        for p, site in lying:
+            w = pw[p]
+            r = seen.get(w)
+            if r is None:
+                cin = cout = 0
+                for j, c in enumerate(caps):
+                    if c >= w:
+                        cin |= tm[j]
+                        cout |= ALL ^ tm[j]
+                r = seen[w] = (cin, cout)
+            m = rmask[site]
+            vi |= m & ~r[0]
+            vo |= (ALL ^ m) & ~r[1]
+        return vi, vo
+
+    def _cycle_bound(self, bucket, tnode):
+        """Sum over the cycle blocks of a lower bound on the DRIVE actions along the block's road edges."""
+        total = 0
+        pgoal = self.pr.pgoal
+        for bi, (cl, dist, radius, far) in enumerate(self.blocks):
+            items = []
+            for p, site, hol in bucket:
+                a = cl[site]
+                b = cl[pgoal[p]]
+                if a != b or hol < 0:
+                    items.append((p, a, b, hol < 0))
+            if not items:
+                continue
+            tcl = tuple(cl[tnode[t]] for t in self.trucks)
+            key = (bi, tcl, tuple(items))
+            v = self.cyc_cache.get(key)
+            if v is None:
+                v = self.cyc_cache[key] = self._block_bound(dist, radius, far, items, tcl)
+            total += v
+        return total
+
+    def _block_bound(self, dist, radius, far, items, tcl):
+        """max(per-block fractional bound, best ball family). items: (package, cluster now, goal cluster,
+        lying?) for the packages that matter; tcl: the cluster of every truck of the region."""
+        pw = self.pr.bound_weights
+        pbig = self.pbig
+        cfw = self.cfw
+        cm = self.cmax
+        WB, BB, TSH = self.WB, self.BB, self.TSH
+        TM, mc, VIB, VOB = self.TMASK, self.mcap, self.VIB, self.VOB
+        road0 = self.road0
+        fr = 0
+        for p, a, b, lying in items:
+            d = dist[a][b]
+            if d < far:
+                fr += cfw[p] * d
+        best = -(-fr // cm)
+        # Every centre gives a valid family (Lemma 8), so any subset of centres may be tried. The clusters
+        # where a package that matters is now are the natural centres: balls around them count the trip of
+        # a truck to that package and of the package to its goal.
+        for z in {a for p, a, b, lying in items}:
+            R = radius[z]
+            if R <= 0:
+                continue
+            dz = dist[z]
+            n2 = R + 2
+            wo = [0] * n2
+            wi = [0] * n2
+            bo = [0] * n2
+            bi = [0] * n2
+            tm = [0] * n2
+            lin = [-1] * n2         # largest lying weight at exactly this distance (R + 1: farther)
+            for p, a, b, lying in items:
+                da = dz[a] if dz[a] <= R else R + 1
+                db = dz[b] if dz[b] <= R else R + 1
+                if da < db:         # inside the ball for r = da+1 .. db, goal outside: must go out
+                    w = pw[p]
+                    wo[da + 1] += w
+                    wo[db + 1 if db <= R else R + 1] -= w
+                    if pbig[p]:
+                        bo[da + 1] += 1
+                        bo[db + 1 if db <= R else R + 1] -= 1
+                elif db < da:       # goal inside for r = db+1 .. da, package outside: must come in
+                    w = pw[p]
+                    wi[db + 1] += w
+                    wi[da + 1 if da <= R else R + 1] -= w
+                    if pbig[p]:
+                        bi[db + 1] += 1
+                        bi[da + 1 if da <= R else R + 1] -= 1
+                if lying and pw[p] > lin[da]:
+                    lin[da] = pw[p]
+            for j, c in enumerate(tcl):
+                dt = dz[c]
+                if dt < R:
+                    tm[dt + 1] += 1 << j
+            # suffix maxima of the lying weights: the largest lying weight at distance >= r
+            suf = [-1] * (n2 + 1)
+            for r in range(R + 1, -1, -1):
+                suf[r] = lin[r] if lin[r] > suf[r + 1] else suf[r + 1]
+            s_wo = s_wi = s_bo = s_bi = s_tm = 0
+            pre = -1                # the largest lying weight at distance < r
+            tot = 0
+            for r in range(1, R + 1):
+                s_wo += wo[r]
+                s_wi += wi[r]
+                s_bo += bo[r]
+                s_bi += bi[r]
+                s_tm += tm[r]
+                if lin[r - 1] > pre:
+                    pre = lin[r - 1]
+                v = s_wo | (s_wi << WB) | (s_bo << (2 * WB)) | (s_bi << (2 * WB + BB)) | (s_tm << TSH)
+                if pre > mc[s_tm]:
+                    v |= VIB
+                if suf[r] > mc[TM ^ s_tm]:
+                    v |= VOB
+                tot += road0[v]
+            if tot > best:
+                best = tot
+        return best
+
+    def _ferry_bound(self, state, bucket, tnode, tfer, cv, lying, vi, vo):
+        """Port and piece costs depend on island membership, not on drives within an island.
+        The key does not tell a lying package from one carried by a standing truck at the same place. That is
+        safe (proof, Section 16): the carrying truck is able to carry it and sits on the same side of every
+        cut, so such a package never sets a visit flag, whether it lies or is carried."""
         pr = self.pr
         n, IF = pr.n, pr.IF
         pos1 = self.pos1
@@ -676,24 +910,46 @@ class _Region:
         total2 = 0
         balance = [0] * pr.F
         pres = None
+        TM, mc = self.TMASK, self.mcap
+        pw = pr.bound_weights
         if self.ncut > R:
             pres = {}
             WB, BB, WM, BM = self.WB, self.BB, self.WM, self.BM
-            pw = pr.bound_weights
+            TSH = self.TSH
+            rmask = self.rmask
             pbig = self.pbig
             for i in range(R, self.ncut):
                 v = cv[i]
                 f, a, inside = self.cut_port[i]
                 docked = state[IF + f] == a
-                aboard = False
+                dmask = 0                   # region trucks aboard f while f is docked at a
                 if docked:
-                    for t in self.trucks:
+                    for j, t in enumerate(self.trucks):
                         if tfer[t] == f:
-                            aboard = True
+                            dmask |= 1 << j
+                msub = (v >> TSH) & TM      # trucks inside the subtree
+                mx = msub if inside else TM ^ msub      # trucks on the port side
+                # visit flags of the port side X (the masks are oriented to the subtree side)
+                bit = 1 << i
+                if inside:
+                    vin = 1 if vi & bit else 0
+                    vout = 1 if vo & bit else 0
+                else:
+                    vin = 1 if vo & bit else 0
+                    vout = 1 if vi & bit else 0
+                varr = vin
+                if vin and dmask:
+                    # an arrival is needed unless a truck aboard f could walk in and carry every lying
+                    # package of X that the trucks of X cannot carry
+                    cap = mc[mx | dmask]
+                    varr = 0
+                    for p, site in lying:
+                        if ((rmask[site] >> i) & 1) == inside and pw[p] > cap:
+                            varr = 1
                             break
-                if not (v & self.WFM) and not aboard:
+                if not (v & self.WFM) and not dmask and not vin and not vout:
                     continue
-                ts = (v >> self.TSH).bit_count()
+                ts = mx.bit_count()
                 if inside:
                     wo = v & WM
                     wi = (v >> WB) & WM
@@ -704,15 +960,12 @@ class _Region:
                     wo = (v >> WB) & WM
                     bi = (v >> (2 * WB)) & BM
                     bo = (v >> (2 * WB + BB)) & BM
-                    ts = self.ntrucks - ts
-                wn = bn = ndock = 0
+                wn = bn = 0
+                ndock = dmask.bit_count()
                 cargo = None
-                if aboard:
+                if dmask:
                     lo, hi = self.cut_lo[i], self.cut_hi[i]
                     per = {}
-                    for t in self.trucks:
-                        if tfer[t] == f:
-                            ndock += 1
                     for p, site, hol in bucket:
                         if hol >= 0 and tfer[hol] == f:
                             gin = (lo < pos1[pr.pgoal[p]] <= hi) == inside
@@ -728,8 +981,10 @@ class _Region:
                                     c[1] += pbig[p]
                     if per:
                         cargo = list(per.values())
-                c2, boards, disemb, diff = self.port_cost(wo, bo, wi, bi, wn, bn, cargo, ts, ndock, max(pr.fk[f], 1),
-                                                          1 if docked else 0, 0 if docked else 1)
+                kf = max(pr.fk[f], 1)
+                hd = 1 if docked else 0
+                c2, boards, disemb, diff = self.port_cost(wo, bo, wi, bi, wn, bn, cargo, ts, ndock, kf,
+                                                          hd, 1 - hd, vin, varr, vout)
                 balance[self.ferry_group[f]] += diff
                 total2 += c2
                 if c2:
@@ -737,7 +992,6 @@ class _Region:
         piece2 = 0
         Q = self.npiece
         if Q:
-            pw = pr.bound_weights
             pbig = self.pbig
             pm = self.pmask
             pgm = self.pgmask
@@ -784,44 +1038,81 @@ class _Region:
                                     c[0] += pw[p]
                                     c[1] += pbig[p]
                                 active |= 1 << q
-            if active:
-                ts = [0] * Q
-                nd = [0] * Q
-                for t in self.trucks:
-                    o = pm[tnode[t]]
-                    while o:
-                        low = o & -o
-                        ts[low.bit_length() - 1] += 1
-                        o ^= low
-                    f = tfer[t]
-                    if f >= 0:
-                        q = dockpiece.get(f * n + state[IF + f])
-                        if q is not None:
-                            nd[q] += 1
-                o = active
+            # trucks with their node in X_q (tmq) and trucks aboard a ferry docked at a non-bridge port of q
+            # (dmq); the two masks are disjoint because such a ferry node lies outside X_q
+            tmq = [0] * Q
+            dmq = [0] * Q
+            for j, t in enumerate(self.trucks):
+                bit = 1 << j
+                o = pm[tnode[t]]
                 while o:
                     low = o & -o
-                    q = low.bit_length() - 1
+                    tmq[low.bit_length() - 1] |= bit
                     o ^= low
-                    here = away = 0
-                    for f, ports in self.piece_ferries[q]:
-                        if state[IF + f] in ports:
-                            here += 1
-                        else:
-                            away += 1
-                    cg = None
-                    if cargo:
-                        cg = [c for (q2, _), c in cargo.items() if q2 == q]
-                    cost = self.port_cost(Wo[q], Bo[q], Wi[q], Bi[q], Wn[q], Bn[q], cg, ts[q], nd[q],
-                                          self.piece_k[q], here, away)
-                    piece2 += cost[0]
-                    balance[self.ferry_group[self.piece_ferries[q][0][0]]] += cost[3]
+                f = tfer[t]
+                if f >= 0:
+                    q = dockpiece.get(f * n + state[IF + f])
+                    if q is not None:
+                        dmq[q] |= bit
+            # visit flags of all pieces at once, as bit masks over piece indices (same rule as
+            # _visit_masks): qvi has bit q when X_q holds a lying undelivered package that no truck in X_q
+            # can carry, qvo the same outside X_q
+            qvi = qvo = 0
+            if lying:
+                ALLQ = self.ALLQ
+                caps = self.caps
+                ptm = [pm[tnode[t]] for t in self.trucks]
+                seen = {}
+                for p, site in lying:
+                    w = pw[p]
+                    r = seen.get(w)
+                    if r is None:
+                        cin = cout = 0
+                        for j, c in enumerate(caps):
+                            if c >= w:
+                                cin |= ptm[j]
+                                cout |= ALLQ ^ ptm[j]
+                        r = seen[w] = (cin, cout)
+                    m = pm[site]
+                    qvi |= m & ~r[0]
+                    qvo |= (ALLQ ^ m) & ~r[1]
+                active |= qvi | qvo
+            o = active
+            while o:
+                low = o & -o
+                q = low.bit_length() - 1
+                o ^= low
+                here = away = 0
+                for f, ports in self.piece_ferries[q]:
+                    if state[IF + f] in ports:
+                        here += 1
+                    else:
+                        away += 1
+                cg = None
+                if cargo:
+                    cg = [c for (q2, _), c in cargo.items() if q2 == q]
+                vin = (qvi >> q) & 1
+                vout = (qvo >> q) & 1
+                varr = vin
+                if vin and dmq[q]:
+                    cap = mc[tmq[q] | dmq[q]]
+                    varr = 0
+                    for p, site in lying:
+                        if (pm[site] >> q) & 1 and pw[p] > cap:
+                            varr = 1
+                            break
+                cost = self.port_cost(Wo[q], Bo[q], Wi[q], Bi[q], Wn[q], Bn[q], cg, tmq[q].bit_count(),
+                                      dmq[q].bit_count(), self.piece_k[q], here, away, vin, varr, vout)
+                piece2 += cost[0]
+                balance[self.ferry_group[self.piece_ferries[q][0][0]]] += cost[3]
         sail_extra2 = 3 * sum(map(abs, balance))
         result = (total2, pres or {}, piece2, sail_extra2)
         self.ferry_cache[key] = result
         return result
 
-    def _road_extra(self, bucket, cv, pres):
+    def _road_extra(self, bucket, cv, pres, tnode):
+        """Merge and first-entry extras. The key holds cv, which fixes on which side of every cut each truck
+        is, so reading tnode below does not make the cached value depend on anything outside the key."""
         key = (tuple(cv), tuple(bucket), tuple(pres.items()))
         result = self.road_extra_cache.get(key)
         if result is not None:
@@ -839,46 +1130,60 @@ class _Region:
             # loads. If no package outside U has its goal in a side, each of these crossings into it
             # (or an earlier one over the same bridge) brought nothing in: it comes on top of the
             # crossings that are needed afterwards, when one more truck is inside.
-            TB = self.TB
-            ALLB = self.ALLB
-            WFM = self.WFM
-            cand = [i for i in self.rroad if (cv[i] < TB or cv[i] >= ALLB) and cv[i] & WFM]
-            if cand:
-                cs = cc = 0
-                for i in cand:
-                    if not (used >> i) & 1:
-                        if cv[i] < TB:
-                            cs |= 1 << i
-                        else:
-                            cc |= 1 << i
+            # Candidate sides, as bit masks over the road cuts: an unreserved road bridge that some
+            # package of positive weight must cross, with no truck in its subtree (cs) or no truck on the
+            # other side (cc).
+            rmask = self.rmask
+            pgoal = pr.pgoal
+            pw = pr.bound_weights
+            roads = self.ROADS
+            anyt = 0                # cuts whose subtree holds some truck
+            allt = roads            # cuts whose subtree holds every truck
+            for t in self.trucks:
+                m = rmask[tnode[t]]
+                anyt |= m
+                allt &= m
+            marks = []
+            crossed = 0
+            for p, site, hol in bucket:
+                m = rmask[site]
+                mg = rmask[pgoal[p]]
+                marks.append((m, mg))
+                if pw[p] > 0:
+                    crossed |= m ^ mg
+            cand = crossed & roads & ~used
+            cs = cand & ~anyt
+            cc = cand & allt
+            if cs or cc:
+                # Greatest set U of candidate sides such that no package outside U has its goal in a side
+                # of U (proof, Lemma 10): drop the sides that receive a package from outside until stable.
+                changed = True
+                while changed and (cs or cc):
+                    changed = False
+                    for m, mg in marks:
+                        if not ((m & cs) or (~m & cc)):
+                            ncs = cs & ~mg
+                            ncc = cc & mg
+                            if ncs != cs or ncc != cc:
+                                cs, cc = ncs, ncc
+                                changed = True
+                best = None
                 if cs or cc:
-                    rmask = self.rmask
-                    pgoal = pr.pgoal
-                    # sides that get something from a package that is outside U now: no claim there
-                    inside = []
-                    for p, site, hol in bucket:
-                        m = rmask[site]
-                        if (m & cs) or (~m & cc):
-                            inside.append(m)
-                        else:
-                            m = rmask[pgoal[p]]
-                            cs &= ~m
-                            cc &= m
-                    best = None
-                    if cs or cc:
-                        for m in inside:
-                            ins = m & cs
-                            outs = ~m & cc
-                            v = 0
-                            if ins:
-                                v = sum(map(self.first_in.__getitem__, map(cv.__getitem__, self.split[ins][0])))
-                            if outs:
-                                v += sum(map(self.first_out.__getitem__, map(cv.__getitem__, self.split[outs][0])))
-                            if best is None or v < best:
-                                best = v
-                                if not v:
-                                    break
-                    xfer += best or 0
+                    for m, mg in marks:
+                        ins = m & cs
+                        outs = ~m & cc
+                        if not (ins or outs):
+                            continue            # this package is outside U: it cannot be the first LOAD in U
+                        v = 0
+                        if ins:
+                            v = sum(map(self.first_in.__getitem__, map(cv.__getitem__, self.split[ins][0])))
+                        if outs:
+                            v += sum(map(self.first_out.__getitem__, map(cv.__getitem__, self.split[outs][0])))
+                        if best is None or v < best:
+                            best = v
+                            if not v:
+                                break
+                xfer += best or 0
         self.road_extra_cache[key] = xfer
         return xfer
 
@@ -1635,10 +1940,10 @@ class LogisticsProblem(search.Problem):
         state = node.state.s
         if self.dead:
             return 0            # the initial layout has a package separated from its goal
-        key = state[1:]
-        h = self.hcache.get(key)
+        # the leading field of a state is always 0, so the tuple itself is the key
+        h = self.hcache.get(state)
         if h is None:
-            h = self.hcache[key] = self._h(state)
+            h = self.hcache[state] = self._h(state)
         return h
 
     def _h(self, state):
@@ -1659,15 +1964,10 @@ class LogisticsProblem(search.Problem):
                 f = (tc - n) >> 1
                 tnode[t] = n + f
                 tfer[t] = f
-        # the bound does not depend on the bookkeeping part of the state, only on where things are
-        if self.F:
-            key = (tuple(tnode), state[self.IF:])
-        else:
-            key = state[1:]
-        h = self.hcache2.get(key)
-        if h is None:
-            h = self.hcache2[key] = self._bound(state, tnode, tfer)
-        return h
+        # A second cache keyed by (truck nodes, the rest of the state) used to sit here. It could never hit
+        # after a miss of hcache: it only folded the truck codes n + 2f and n + 2f + 1 together, and the
+        # successor function never produces n + 2f. So the bound is computed directly.
+        return self._bound(state, tnode, tfer)
 
     def _bound(self, state, tnode, tfer):
         n = self.n
@@ -1699,7 +1999,10 @@ class LogisticsProblem(search.Problem):
                     bucket.append((p, tnode[c - n], c - n))
             if bucket:
                 reg = self.regions[0]
-                # Custody affects movement only for merging groups or cargo aboard a ferry.
+                # Custody affects movement only for merging groups or cargo aboard a ferry. A package carried
+                # by a standing truck and one lying at the same place give the same value: the carrying
+                # truck can carry it and stands at that node, so neither version sets a visit flag
+                # (proof, Section 16). So a LOAD or UNLOAD child reuses its parent's value.
                 key = (tuple(tnode), state[self.IF:IP],
                        tuple((p, site, hol if site >= n or pgoal[p] in reg.merge_goals else -1)
                              for p, site, hol in bucket))

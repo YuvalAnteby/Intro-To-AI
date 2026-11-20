@@ -18,6 +18,9 @@
 #   - Fixed numeric cargo and ferry bounds using integer relaxations and the checker's capacity tests.
 #   - Added incremental canonicalization and a proof of equivalence to the original canonical keys.
 #   - Reused ferry occupancy for BOARD checks and proved equivalence with both optimizations enabled.
+#   - Cached each state's hash lazily, preserving the exact key and hash values.
+#   - Added state-based stubborn-set pruning, its capacity/commutation proof, and a safe closure fallback.
+#   - Disabled endpoint-only corridor pruning after proving a retained-state suffix counterexample.
 #
 # Claude Opus 5.5:
 #   - Re-derived every part of the heuristic and wrote a complete formal admissibility proof
@@ -26,7 +29,9 @@
 #     (ball families and per-cycle fractions), and a stronger first-entry selection, then reduced their
 #     cost per state after the timings showed it. The successor function and its pruning were not changed.
 #
-# No other online sources were used.
+# Python's hash contract and tuple-hash implementation notes were consulted for the hash cache:
+# https://docs.python.org/3/reference/datamodel.html#object.__hash__
+# https://github.com/python/cpython/issues/131525
 
 import ex1_check
 import search
@@ -48,11 +53,13 @@ OPT_SYM = True        # states that differ only by a renaming of identical objec
 OPT_DEAD = True       # never enter a dead end of the map where there is nothing to do
 OPT_BARREN = False    # disabled pending a proof that does not rely on truck focus
 OPT_FIRST = True      # heuristic only: first-entry lower bound
-OPT_CORRIDOR = True   # transfers on empty road corridors can be moved to an endpoint
+OPT_CORRIDOR = False  # unsafe for optimal suffixes from retained interior-corridor states
 
 # Representation only: compute the same canonical key from the parent's key and the action.
-OPT_INCREMENTAL_CANON = True
+OPT_INCREMENTAL_CANON = False
 OPT_OCCUPANCY_REUSE = True  # reuse parent-state ferry counts for all BOARD checks
+OPT_HASH_CACHE = False      # profiling found no benefit on the target Python 3.12 runtime
+OPT_PARTIAL_ORDER = False   # proved safe; opt in to benchmark (PARTIAL_ORDER_PROOF.md)
 
 
 def _canon_edit(items, old=None, new=None):
@@ -74,7 +81,7 @@ class _State(object):
     Two states are equal if one becomes the other by renaming objects that are fully interchangeable
     (trucks with the same capacity, ferries of the same line and size, packages with the same weight and
     goal). The search then expands only one of them. The key contains no action history."""
-    __slots__ = ("s", "k", "pr", "parts")
+    __slots__ = ("s", "k", "pr", "parts", "kh")
 
     def __init__(self, pr, s, key=None, parts=None):
         self.s = s
@@ -82,11 +89,18 @@ class _State(object):
         self.pr = pr
         # Immutable cargo-by-truck and descriptor-by-ferry tuples; no parent reference.
         self.parts = parts
+        self.kh = None
 
     def __hash__(self):
         if self.k is None:
             self.k = self.pr._canon(self.s)
-        return hash(self.k)
+        if not OPT_HASH_CACHE:
+            return hash(self.k)
+        value = self.kh
+        if value is None:
+            value = hash(self.k)
+            self.kh = value
+        return value
 
     def __eq__(self, other):
         if self.k is None:
@@ -112,6 +126,251 @@ class _Memo(dict):
     def __missing__(self, key):
         value = self[key] = self.fn(key)
         return value
+
+
+class _Stubborn:
+    """State-based strong stubborn sets; see PARTIAL_ORDER_PROOF.md.
+
+    Operators use their destination, not their source, as the movement ID.
+    The dependency masks overapproximate interference in every legal state.
+    Nonapplicable operators add a necessary enabling set. Applicable ones
+    also add the representative retained by the existing twin filters.
+    """
+
+    def __init__(self, pr):
+        self.pr = pr
+        n, T, F, P = pr.n, pr.T, pr.F, pr.P
+        self.ops = []
+        self.lookup = {}
+        self.drive = [[0] * n for _ in range(T)]
+        self.load = [[0] * T for _ in range(P)]
+        self.unload = [[0] * T for _ in range(P)]
+        self.board = [[0] * F for _ in range(T)]
+        self.leave = [[0] * F for _ in range(T)]
+        self.sail = [[0] * n for _ in range(F)]
+
+        def add(kind, x, y):
+            bit = 1 << len(self.ops)
+            self.ops.append((kind, x, y))
+            return bit
+
+        self.incoming = [set() for _ in range(n)]
+        for u, neighbours in enumerate(pr.adj_go):
+            for v in neighbours:
+                self.incoming[v].add(u)
+        for t in range(T):
+            for v, sources in enumerate(self.incoming):
+                if sources and (not pr.node_rank or pr.node_rank[v] == pr.trank[t]):
+                    bit = self.drive[t][v] = add(0, t, v)
+                    for u in sources:
+                        self.lookup['DRIVE{%d,%d,%d}' % (pr.tids[t], u, v)] = bit
+        for p in range(P):
+            for t in range(T):
+                if pr.prank[p] != pr.trank[t] or pr.pw[p] > pr.tcap[t]:
+                    continue
+                self.load[p][t] = add(1, p, t)
+                self.unload[p][t] = add(2, p, t)
+                self.lookup['LOAD{%d,%d}' % (pr.pids[p], pr.tids[t])] = self.load[p][t]
+                self.lookup['UNLOAD{%d,%d}' % (pr.pids[p], pr.tids[t])] = self.unload[p][t]
+        for t in range(T):
+            for f in range(F):
+                if pr.fdead[f] or pr.trank[t] != pr.frank[f] or pr.fcap[f] < 1:
+                    continue
+                self.board[t][f] = add(3, t, f)
+                self.leave[t][f] = add(4, t, f)
+                self.lookup['BOARD{%d,%d}' % (pr.tids[t], pr.fids[f])] = self.board[t][f]
+                self.lookup['DISEMBARK{%d,%d}' % (pr.tids[t], pr.fids[f])] = self.leave[t][f]
+        for f in range(F):
+            for v in pr.sail_to[f]:
+                bit = self.sail[f][v] = add(5, f, v)
+                for u in pr.fports[f]:
+                    if u != v:
+                        self.lookup['SAIL{%d,%d,%d}' % (pr.fids[f], u, v)] = bit
+
+        # Disjoint one-bit entries make sum a bitwise union here.
+        self.ld = [sum(row) for row in self.load]
+        self.ud = [sum(row) for row in self.unload]
+        self.dm = [sum(row) for row in self.drive]
+        self.bm = [sum(row) for row in self.board]
+        self.em = [sum(row) for row in self.leave]
+        self.sm = [sum(row) for row in self.sail]
+        self.lt = [sum(self.load[p][t] for p in range(P)) for t in range(T)]
+        self.ut = [sum(self.unload[p][t] for p in range(P)) for t in range(T)]
+        self.bf = [sum(self.board[t][f] for t in range(T)) for f in range(F)]
+        self.ef = [sum(self.leave[t][f] for t in range(T)) for f in range(F)]
+        self.port_ferries = [tuple(f for f in range(F) if v in pr.fports[f]) for v in range(n)]
+
+        self.dep = []
+        for kind, x, y in self.ops:
+            if kind == 0:  # DRIVE: the same truck's standing actions can interfere.
+                dep = self.dm[x] | self.bm[x] | self.lt[x] | self.ut[x]
+            elif kind == 1:  # LOAD: same package, or competing LOADs into the same truck.
+                dep = self.dm[y] | self.bm[y] | self.ld[x] | self.lt[y]
+            elif kind == 2:  # UNLOAD only frees capacity; other handling actions commute.
+                dep = self.dm[y] | self.bm[y]
+            elif kind == 3:  # BOARD: same truck, competing BOARDs, or moving this ferry.
+                dep = self.dm[x] | self.bm[x] | self.lt[x] | self.ut[x] | self.sm[y]
+                if pr.fcap[y] < T:
+                    dep |= self.bf[y]
+            elif kind == 4:  # DISEMBARK frees a slot; only its ferry moving interferes.
+                dep = self.sm[y]
+            else:  # SAIL: dock position is read by BOARD and DISEMBARK.
+                dep = self.sm[x] | self.bf[x] | self.ef[x]
+            self.dep.append(dep)
+
+        self.drive_nes = [[0] * n for _ in range(T)]
+        self.board_nes = [[0] * F for _ in range(T)]
+        for t in range(T):
+            for v, sources in enumerate(self.incoming):
+                mask = sum(self.drive[t][u] for u in sources)
+                for f in range(F):
+                    if sources.intersection(pr.fports[f]):
+                        mask |= self.leave[t][f]
+                self.drive_nes[t][v] = mask
+            for f in range(F):
+                mask = sum(self.drive[t][v] for v in pr.fports[f])
+                ports = set(pr.fports[f])
+                for other in range(F):
+                    if ports.intersection(pr.fports[other]):
+                        mask |= self.leave[t][other]
+                self.board_nes[t][f] = mask
+
+    def keep(self, state, raw):
+        """Return retained raw indices; None means retain everything, in the same order."""
+        if len(raw) <= 1:
+            return None
+        pr = self.pr
+        n, T, F, P = pr.n, pr.T, pr.F, pr.P
+        truck = state[1:pr.IF]
+        dock = state[pr.IF:pr.IP]
+        package = state[pr.IP:]
+        inside = [[] for _ in range(T)]
+        weight = [0] * T
+        aboard = [[] for _ in range(F)]
+        seed = 0
+        for p, loc in enumerate(package):
+            if loc >= n:
+                t = loc - n
+                inside[t].append(p)
+                weight[t] += pr.pw[p]
+            if not seed and loc != pr.pgoal[p] and (not pr.multi or pr.prank[p] == pr._rank):
+                seed = self.unload[p][loc-n] if loc >= n else self.ld[p]
+        for t, loc in enumerate(truck):
+            if loc >= n:
+                aboard[(loc-n) >> 1].append(t)
+        if not seed:
+            return None
+
+        # Make each selected applicable action's existing twin representative available.
+        tr, fr, ps = list(range(T)), list(range(F)), list(range(P))
+        if OPT_TWINS:
+            seen = {}
+            for t in range(T):
+                if not inside[t]:
+                    tr[t] = seen.setdefault((truck[t], pr.tcls[t]), t)
+            seen = {}
+            for f in range(F):
+                if not aboard[f]:
+                    fr[f] = seen.setdefault((dock[f], pr.fcls[f]), f)
+            seen = {}
+            for p in range(P):
+                ps[p] = seen.setdefault((package[p], pr.pcls[p]), p)
+
+        # Once every baseline successor is selected, further closure cannot prune anything.
+        bits = [self.lookup.get(action, 0) for action, _ in raw]
+        if 0 in bits:
+            return None
+        raw_mask = 0
+        for bit in bits:
+            raw_mask |= bit
+        members = pending = seed
+        applicable = 0
+        steps = 0
+        while pending:
+            if members & raw_mask == raw_mask:
+                return None
+            steps += 1
+            if steps > 96:
+                return None  # Abandon the whole reduction, never use an unfinished closure.
+            bit = pending & -pending
+            pending ^= bit
+            index = bit.bit_length()-1
+            kind, x, y = self.ops[index]
+            extra = 0
+            enabled = False
+            representative = bit
+            if kind == 0:  # DRIVE(t, destination)
+                loc = truck[x]
+                if loc >= n:
+                    extra = self.leave[x][(loc-n) >> 1]
+                elif loc in self.incoming[y]:
+                    enabled = True
+                    representative = self.drive[tr[x]][y]
+                else:
+                    extra = self.drive_nes[x][y]
+            elif kind == 1:  # LOAD(p, t)
+                loc, tl = package[x], truck[y]
+                if loc == pr.pgoal[x]:
+                    pass  # Delivered packages never move again in this graph.
+                elif loc >= n:
+                    extra = self.unload[x][loc-n]
+                elif tl >= n:
+                    extra = self.leave[y][(tl-n) >> 1]
+                elif tl != loc:
+                    extra = self.drive[y][loc] | (self.ld[x] & ~bit)
+                    for f in self.port_ferries[loc]:
+                        extra |= self.leave[y][f]
+                elif weight[y] + pr.pw[x] > pr.tcap[y]:
+                    for p in inside[y]:
+                        extra |= self.unload[p][y]
+                else:
+                    enabled = True
+                    representative = self.load[ps[x]][tr[y]]
+            elif kind == 2:  # UNLOAD(p, t)
+                tl = truck[y]
+                if package[x] != n+y:
+                    extra = self.load[x][y]
+                elif tl >= n:
+                    extra = self.leave[y][(tl-n) >> 1]
+                elif OPT_CORRIDOR and tl not in pr.transfer_sites:
+                    extra = self.dm[y] | self.bm[y]
+                else:
+                    enabled = True
+                    representative = self.unload[ps[x]][y]
+            elif kind == 3:  # BOARD(t, f)
+                loc = truck[x]
+                if loc >= n:
+                    extra = self.leave[x][(loc-n) >> 1]
+                elif loc != dock[y]:
+                    extra = self.board_nes[x][y] | self.sail[y][loc]
+                elif len(aboard[y]) >= pr.fcap[y]:
+                    for t in aboard[y]:
+                        extra |= self.leave[t][y]
+                else:
+                    enabled = True
+                    representative = self.board[tr[x]][fr[y]]
+            elif kind == 4:  # DISEMBARK(t, f)
+                if truck[x] >= n and (truck[x]-n) >> 1 == y:
+                    enabled = True
+                    representative = self.leave[tr[x]][y]
+                else:
+                    extra = self.board[x][y]
+            else:  # SAIL(f, destination)
+                if dock[x] != y:
+                    enabled = True
+                    representative = self.sail[fr[x]][y]
+                else:
+                    extra = self.sm[x] & ~bit
+            if enabled:
+                applicable |= bit
+                extra = self.dep[index] | representative
+            extra &= ~members
+            members |= extra
+            pending |= extra
+
+        keep = [i for i, bit in enumerate(bits) if bit & applicable]
+        # Retaining extra actions is always safe. An empty closure need not be used as a dead-end test.
+        return keep if keep and len(keep) < len(raw) else None
 
 
 class _Region:
@@ -1468,6 +1727,9 @@ class LogisticsProblem(search.Problem):
         self.sail_to = [() if f in dead_ferry else tuple(b for b in self.fports[f] if (f, b) not in dead_sail)
                         for f in range(F)]
         self.fdead = [f in dead_ferry for f in range(F)]
+        self._por = (_Stubborn(self) if OPT_PARTIAL_ORDER and self.integer_cargo
+                     and all(type(k) is int and k >= 1 for k in self.fcap)
+                     and not OPT_BARREN else None)
 
     # ------------------------------------------------------------------ precomputation on the map
     def _build_regions(self):
@@ -1944,11 +2206,13 @@ class LogisticsProblem(search.Problem):
         3. Use one representative among truly interchangeable packages/trucks/ferries.
         4. Do not enter precomputed dead map sides / dominated ports.
         5. Solve independent map components in a canonical component order.
-        6. Transfers on empty degree-two road corridors are restricted to corridor endpoints.
+        6. Optional strong stubborn sets retain a provably optimal next-action choice.
+        Endpoint-only corridor transfers are disabled: they can lose optimal retained-state suffixes.
 
         History-dependent pruning was removed. In particular, there is no truck focus, no post-LOAD order
         restriction, no U-turn ban, no fresh-board restriction, and no forced BOARD after an empty sail.
-        OPT_BARREN is disabled until it has a proof that does not rely on focus."""
+        OPT_BARREN is disabled until it has a proof that does not rely on focus.
+        See PARTIAL_ORDER_PROOF.md for the enabled reductions and their combination."""
         n = self.n
         T = self.T
         F = self.F
@@ -2060,6 +2324,12 @@ class LogisticsProblem(search.Problem):
                         res.append(self._sail(state, f, port, b))
                         if changes is not None:
                             changes.append(("sail", f, None))
+        if OPT_PARTIAL_ORDER and self._por is not None:
+            keep = self._por.keep(state, res)
+            if keep is not None:
+                res = [res[i] for i in keep]
+                if changes is not None:
+                    changes[:] = [changes[i] for i in keep]
         return res
 
     def goal_test(self, state):

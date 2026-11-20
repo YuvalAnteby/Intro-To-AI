@@ -17,6 +17,7 @@
 #   - Extended the proofs and regression checks and ran the independent validators and benchmarks.
 #   - Fixed numeric cargo and ferry bounds using integer relaxations and the checker's capacity tests.
 #   - Added incremental canonicalization and a proof of equivalence to the original canonical keys.
+#   - Reused ferry occupancy for BOARD checks and proved equivalence with both optimizations enabled.
 #
 # Claude Opus 5.5:
 #   - Re-derived every part of the heuristic and wrote a complete formal admissibility proof
@@ -51,6 +52,7 @@ OPT_CORRIDOR = True   # transfers on empty road corridors can be moved to an end
 
 # Representation only: compute the same canonical key from the parent's key and the action.
 OPT_INCREMENTAL_CANON = True
+OPT_OCCUPANCY_REUSE = True  # reuse parent-state ferry counts for all BOARD checks
 
 
 def _canon_edit(items, old=None, new=None):
@@ -1656,7 +1658,7 @@ class LogisticsProblem(search.Problem):
         ns[0] = 0
         return ("SAIL{%d,%d,%d}" % (self.fids[f], a, b), tuple(ns))
 
-    def _truck_standing(self, st, t, l, cont, lying, res, changes=None):
+    def _truck_standing(self, st, t, l, cont, lying, res, changes=None, aboard_count=None):
         """World-legal actions of truck t while it is standing at location l."""
         n = self.n
         T = self.T
@@ -1748,11 +1750,14 @@ class LogisticsProblem(search.Problem):
                 if fdead[f] or st[IF + f] != l:
                     continue
                 code0 = n + 2 * f
-                cnt = 0
-                for t2 in range(1, 1 + T):
-                    c = st[t2]
-                    if c == code0 or c == code0 + 1:
-                        cnt += 1
+                if aboard_count is None:
+                    cnt = 0
+                    for t2 in range(1, 1 + T):
+                        c = st[t2]
+                        if c == code0 or c == code0 + 1:
+                            cnt += 1
+                else:
+                    cnt = aboard_count[f]
                 if not (cnt < self.fcap[f]):
                     continue
                 if cnt == 0 and OPT_TWINS:
@@ -2000,6 +2005,10 @@ class LogisticsProblem(search.Problem):
             if tc >= n:
                 aboard_count[(tc - n) >> 1] += 1
 
+        # All children are alternatives from this parent. Read these counts without
+        # updating them after BOARD/DISEMBARK or passing them on to a child state.
+        board_occupancy = aboard_count if OPT_OCCUPANCY_REUSE else None
+
         tcls = self.tcls
         trank = self.trank
         if OPT_FORCED and self.integer_cargo:
@@ -2007,7 +2016,8 @@ class LogisticsProblem(search.Problem):
                 if cargo and (not multi or trank[t] == rank):
                     loc = state[1 + t]
                     if loc < n and any(pgoal[p] == loc for p in cargo):
-                        self._truck_standing(state, t, loc, cargo, lying, res, changes)
+                        self._truck_standing(state, t, loc, cargo, lying, res, changes,
+                                             aboard_count=board_occupancy)
                         return res
         seen_t = set()
         for t in range(T):
@@ -2021,7 +2031,8 @@ class LogisticsProblem(search.Problem):
                     continue
                 seen_t.add(key)
             if tc < n:
-                self._truck_standing(state, t, tc, cont, lying, res, changes)
+                self._truck_standing(state, t, tc, cont, lying, res, changes,
+                                     aboard_count=board_occupancy)
             else:
                 f = (tc - n) >> 1
                 ns = list(state)

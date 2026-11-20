@@ -16,6 +16,7 @@
 #   - Added truck-flow and whole-sail lower bounds, corridor pruning, and caches.
 #   - Extended the proofs and regression checks and ran the independent validators and benchmarks.
 #   - Fixed numeric cargo and ferry bounds using integer relaxations and the checker's capacity tests.
+#   - Added incremental canonicalization and a proof of equivalence to the original canonical keys.
 #
 # Claude Opus 5.5:
 #   - Re-derived every part of the heuristic and wrote a complete formal admissibility proof
@@ -30,6 +31,7 @@ import ex1_check
 import search
 import utils
 
+from bisect import bisect_left, insort_right
 from itertools import accumulate
 from operator import itemgetter, sub
 
@@ -47,6 +49,22 @@ OPT_BARREN = False    # disabled pending a proof that does not rely on truck foc
 OPT_FIRST = True      # heuristic only: first-entry lower bound
 OPT_CORRIDOR = True   # transfers on empty road corridors can be moved to an endpoint
 
+# Representation only: compute the same canonical key from the parent's key and the action.
+OPT_INCREMENTAL_CANON = True
+
+
+def _canon_edit(items, old=None, new=None):
+    """Remove/add one occurrence in an immutable sorted multiset, preserving duplicates."""
+    result = list(items)
+    if old is not None:
+        i = bisect_left(result, old)
+        if i == len(result) or result[i] != old:
+            raise ValueError("Canonical descriptor missing from parent key")
+        del result[i]
+    if new is not None:
+        insort_right(result, new)
+    return tuple(result)
+
 
 class _State(object):
     """A state: the tuple s described in LogisticsProblem.__init__.
@@ -54,12 +72,14 @@ class _State(object):
     Two states are equal if one becomes the other by renaming objects that are fully interchangeable
     (trucks with the same capacity, ferries of the same line and size, packages with the same weight and
     goal). The search then expands only one of them. The key contains no action history."""
-    __slots__ = ("s", "k", "pr")
+    __slots__ = ("s", "k", "pr", "parts")
 
-    def __init__(self, pr, s):
+    def __init__(self, pr, s, key=None, parts=None):
         self.s = s
-        self.k = None
+        self.k = key
         self.pr = pr
+        # Immutable cargo-by-truck and descriptor-by-ferry tuples; no parent reference.
+        self.parts = parts
 
     def __hash__(self):
         if self.k is None:
@@ -1636,7 +1656,7 @@ class LogisticsProblem(search.Problem):
         ns[0] = 0
         return ("SAIL{%d,%d,%d}" % (self.fids[f], a, b), tuple(ns))
 
-    def _truck_standing(self, st, t, l, cont, lying, res):
+    def _truck_standing(self, st, t, l, cont, lying, res, changes=None):
         """World-legal actions of truck t while it is standing at location l."""
         n = self.n
         T = self.T
@@ -1660,6 +1680,10 @@ class LogisticsProblem(search.Problem):
                 if self.multi and self._last == 1:
                     self._finish(ns)
                 res.append(("UNLOAD{%d,%d}" % (self.pids[forced], tid), tuple(ns)))
+                if changes is not None:
+                    # _finish may reset several vehicles: use the original canonicalizer.
+                    changes.append(None if self.multi and self._last == 1
+                                   else ("unload", t, forced))
                 return
             if not OPT_CORRIDOR or l in self.transfer_sites:
                 seen = set()
@@ -1675,6 +1699,9 @@ class LogisticsProblem(search.Problem):
                     if self.multi and pgoal[p] == l and self._last == 1:
                         self._finish(ns)
                     res.append(("UNLOAD{%d,%d}" % (self.pids[p], tid), tuple(ns)))
+                    if changes is not None:
+                        changes.append(None if self.multi and pgoal[p] == l and self._last == 1
+                                       else ("unload", t, p))
         here = lying.get(l)
         if here:
             # Match World.load_of followed by World.load, including the package summation order.
@@ -1692,12 +1719,16 @@ class LogisticsProblem(search.Problem):
                     ns[IP + p] = n + t
                     ns[0] = 0
                     res.append(("LOAD{%d,%d}" % (self.pids[p], tid), tuple(ns)))
+                    if changes is not None:
+                        changes.append(("load", t, p))
         if cont:
             for w in self.adj_go[l]:
                 ns = list(st)
                 ns[1 + t] = w
                 ns[0] = 0
                 res.append(("DRIVE{%d,%d,%d}" % (tid, l, w), tuple(ns)))
+                if changes is not None:
+                    changes.append(("drive", t, None))
         else:
             # OPT_BARREN is currently disabled. The code path remains available for a future proof.
             useful = self._useful
@@ -1707,6 +1738,8 @@ class LogisticsProblem(search.Problem):
                     ns[1 + t] = w
                     ns[0] = 0
                     res.append(("DRIVE{%d,%d,%d}" % (tid, l, w), tuple(ns)))
+                    if changes is not None:
+                        changes.append(("drive", t, None))
         F = self.F
         if F:
             seen = None
@@ -1733,6 +1766,8 @@ class LogisticsProblem(search.Problem):
                 ns[1 + t] = code0 + 1
                 ns[0] = 0
                 res.append(("BOARD{%d,%d}" % (tid, self.fids[f]), tuple(ns)))
+                if changes is not None:
+                    changes.append(("board", t, f))
 
     def _finish(self, ns):
         """The active part of the map is done: its trucks and ferries never act again, so forget where they are."""
@@ -1748,7 +1783,95 @@ class LogisticsProblem(search.Problem):
 
     def successor(self, state):
         """ Generates the successor states returns [(action, achieved_states, ...)]"""
-        return [(action, _State(self, s)) for action, s in self._successors(state.s)]
+        if not OPT_INCREMENTAL_CANON or not OPT_SYM:
+            return [(action, _State(self, s)) for action, s in self._successors(state.s)]
+        changes = []
+        raw = self._successors(state.s, changes)
+        if not raw:
+            return []
+        if len(raw) != len(changes):
+            raise ValueError("Missing canonicalization change for a successor")
+        if state.k is None:
+            state.k = self._canon(state.s)
+        if state.parts is None:
+            state.parts = self._canon_parts(state.s)
+        return [(action, _State(self, s) if change is None
+                 else self._canon_child(state, s, change))
+                for (action, s), change in zip(raw, changes)]
+
+    def _canon_parts(self, s):
+        """Build identity-indexed metadata once for an initial or component-reset state."""
+        n = self.n
+        cargo = [[] for _ in range(self.T)]
+        for p in range(self.P):
+            pos = s[self.IP + p]
+            if pos >= n:
+                cargo[pos - n].append(self.pcls[p])
+        cargo = tuple(tuple(sorted(c)) for c in cargo)
+        aboard = [[] for _ in range(self.F)]
+        for t in range(self.T):
+            tc = s[1 + t]
+            if tc >= n:
+                aboard[(tc - n) >> 1].append((self.tcls[t], cargo[t]))
+        by_ferry = tuple((self.fcls[f], s[self.IF + f], tuple(sorted(aboard[f])))
+                         for f in range(self.F))
+        return (cargo, by_ferry)
+
+    def _canon_child(self, parent, s, change):
+        """Compute exactly _canon(s) by editing the descriptors changed by one action.
+
+        Both the key and the identity-indexed metadata are immutable. Component completion
+        bypasses this method because _finish can change more than the named action's objects.
+        See INCREMENTAL_CANONICALIZATION_PROOF.md for the invariant and all action cases.
+        """
+        standing, ferries, lying = parent.k
+        cargo, by_ferry = parent.parts
+        parts = parent.parts
+        kind, obj, arg = change
+        if kind == "drive":
+            t = obj
+            standing = _canon_edit(standing,
+                                   (parent.s[1 + t], self.tcls[t], cargo[t]),
+                                   (s[1 + t], self.tcls[t], cargo[t]))
+        elif kind == "load" or kind == "unload":
+            t, p = obj, arg
+            cls = self.pcls[p]
+            old_cargo = cargo[t]
+            if kind == "load":
+                new_cargo = _canon_edit(old_cargo, new=cls)
+                lying = _canon_edit(lying, old=parent.s[self.IP + p] * self.npcls + cls)
+            else:
+                new_cargo = _canon_edit(old_cargo, old=cls)
+                lying = _canon_edit(lying, new=s[self.IP + p] * self.npcls + cls)
+            standing = _canon_edit(standing,
+                                   (parent.s[1 + t], self.tcls[t], old_cargo),
+                                   (s[1 + t], self.tcls[t], new_cargo))
+            updated = list(cargo)
+            updated[t] = new_cargo
+            cargo = tuple(updated)
+            parts = (cargo, by_ferry)
+        elif kind in ("board", "disembark", "sail"):
+            f = obj if kind == "sail" else arg
+            old_ferry = by_ferry[f]
+            manifest = old_ferry[2]
+            if kind == "board":
+                t = obj
+                standing = _canon_edit(standing,
+                                       old=(parent.s[1 + t], self.tcls[t], cargo[t]))
+                manifest = _canon_edit(manifest, new=(self.tcls[t], cargo[t]))
+            elif kind == "disembark":
+                t = obj
+                manifest = _canon_edit(manifest, old=(self.tcls[t], cargo[t]))
+                standing = _canon_edit(standing, new=(s[1 + t], self.tcls[t], cargo[t]))
+            new_ferry = (old_ferry[0], s[self.IF + f], manifest)
+            ferries = _canon_edit(ferries, old_ferry, new_ferry)
+            updated = list(by_ferry)
+            updated[f] = new_ferry
+            by_ferry = tuple(updated)
+            parts = (cargo, by_ferry)
+        else:
+            raise ValueError("Unknown canonicalization change")
+        return _State(self, s, (standing, ferries, lying), parts)
 
     def _canon(self, s):
         """The key of a state that is the same for all renamings of interchangeable objects: every truck
@@ -1807,7 +1930,7 @@ class LogisticsProblem(search.Problem):
         ferries.sort()
         return (tuple(standing), tuple(ferries), tuple(lying))
 
-    def _successors(self, state):
+    def _successors(self, state, changes=None):
         """The successors of the tuple of a state: [(action, tuple), ...]
 
         Current pruning rules:
@@ -1884,7 +2007,7 @@ class LogisticsProblem(search.Problem):
                 if cargo and (not multi or trank[t] == rank):
                     loc = state[1 + t]
                     if loc < n and any(pgoal[p] == loc for p in cargo):
-                        self._truck_standing(state, t, loc, cargo, lying, res)
+                        self._truck_standing(state, t, loc, cargo, lying, res, changes)
                         return res
         seen_t = set()
         for t in range(T):
@@ -1898,13 +2021,15 @@ class LogisticsProblem(search.Problem):
                     continue
                 seen_t.add(key)
             if tc < n:
-                self._truck_standing(state, t, tc, cont, lying, res)
+                self._truck_standing(state, t, tc, cont, lying, res, changes)
             else:
                 f = (tc - n) >> 1
                 ns = list(state)
                 ns[1 + t] = state[IF + f]
                 ns[0] = 0
                 res.append(("DISEMBARK{%d,%d}" % (self.tids[t], self.fids[f]), tuple(ns)))
+                if changes is not None:
+                    changes.append(("disembark", t, f))
         if F:
             seen_f = set()
             frank = self.frank
@@ -1922,6 +2047,8 @@ class LogisticsProblem(search.Problem):
                 for b in self.sail_to[f]:
                     if b != port:
                         res.append(self._sail(state, f, port, b))
+                        if changes is not None:
+                            changes.append(("sail", f, None))
         return res
 
     def goal_test(self, state):

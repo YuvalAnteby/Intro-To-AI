@@ -27,7 +27,16 @@
 #     (HEURISTIC_PROOF.md).
 #   - Added to the heuristic: capacity-aware visit requirements on every cut, lower bounds for road cycles
 #     (ball families and per-cycle fractions), and a stronger first-entry selection, then reduced their
-#     cost per state after the timings showed it. The successor function and its pruning were not changed.
+#     cost per state after the timings showed it. That work did not change the successor function.
+#   - In a later session: proposed four state-based successor rules (lazy empty sails, effective capacities,
+#     resting useless trucks, purposeful empty drives), wrote their formal proof (SUCCESSOR_RULES_PROOF.md),
+#     implemented them behind the switches OPT_EMPTY_SAIL, OPT_EFFCAP, OPT_USELESS and OPT_TOWARD, and wrote
+#     an independent exhaustive solver used only to check the implementation.
+#   - Then, under the reading that one optimal plan from the initial state must survive, designed the
+#     history-based rules H1-H4 (focus, no U-turn, fresh board, board next) from scratch, without using any
+#     earlier history-based version of this file, wrote their proof (HISTORY_RULES_PROOF.md, including a
+#     re-derivation of the corridor rule, which is switched on under that reading), implemented them, and
+#     extended the exhaustive checker with a mode for that reading.
 #
 # Python's hash contract and tuple-hash implementation notes were consulted for the hash cache:
 # https://docs.python.org/3/reference/datamodel.html#object.__hash__
@@ -43,9 +52,8 @@ from operator import itemgetter, sub
 
 id = ["212152896"]
 
-# Pruning switches kept in the current version.
-# History-dependent pruning (focus/order/U-turn/fresh-board/forced post-sail BOARD) was removed: it can
-# destroy the optimal continuation of a retained state.
+# Pruning switches. The history-based rules further below (OPT_HISTORY ...) are proved in HISTORY_RULES_PROOF.md,
+# written from scratch for this version under the reading that an optimal plan from the initial state must survive.
 OPT_TWINS = True      # symmetry between identical trucks / ferries / packages
 OPT_FORCED = True     # a truck standing at the goal of a package it carries may only unload it
 OPT_COMP = True       # independent parts of the map are solved one after the other
@@ -53,13 +61,33 @@ OPT_SYM = True        # states that differ only by a renaming of identical objec
 OPT_DEAD = True       # never enter a dead end of the map where there is nothing to do
 OPT_BARREN = False    # disabled pending a proof that does not rely on truck focus
 OPT_FIRST = True      # heuristic only: first-entry lower bound
-OPT_CORRIDOR = False  # unsafe for optimal suffixes from retained interior-corridor states
+OPT_CORRIDOR = True   # transfers only at anchors: valid under condition 1 (PRUNING_PROOF.md section 8), not under 2
 
 # Representation only: compute the same canonical key from the parent's key and the action.
 OPT_INCREMENTAL_CANON = False
 OPT_OCCUPANCY_REUSE = True  # reuse parent-state ferry counts for all BOARD checks
 OPT_HASH_CACHE = False      # profiling found no benefit on the target Python 3.12 runtime
 OPT_PARTIAL_ORDER = False   # proved safe; opt in to benchmark (PARTIAL_ORDER_PROOF.md)
+
+# State-based successor rules, proved in SUCCESSOR_RULES_PROOF.md. They read only the current state, so every
+# retained state keeps its world-optimal continuation. Active only with integer weights and capacities.
+# OPT_PARTIAL_ORDER is ignored while any of them is on (its proof assumes the old successor list).
+OPT_EMPTY_SAIL = True   # Rule A: an empty ferry sails only to a port where a truck that is not useless stands
+OPT_EFFCAP = True       # Rule B: twin/merge classes by effective capacity (reachable load, usable truck slots)
+OPT_USELESS = True      # Rule C: an empty standing truck that cannot carry any undelivered package never acts
+OPT_TOWARD = True       # Rule D: an empty standing truck drives only along a shortest road path to a target
+
+# History-based normal forms, proved in HISTORY_RULES_PROOF.md under the reading "an optimal plan from the initial
+# state must survive" (condition 1). The history is stored in the leading field of the state tuple and is part of
+# the canonical key. Active only with integer weights and capacities.
+OPT_HISTORY = True      # master switch for the four rules below
+OPT_FOCUS = True        # H1: after a DRIVE or LOAD of a truck, the next action is that truck's (or an empty sail to it)
+OPT_UTURN = True        # H2: a truck in focus does not drive straight back to where it came from (needs OPT_FOCUS)
+OPT_FRESH = True        # H3: a truck that boarded a ferry does not disembark before the ferry sails
+OPT_NEEDBOARD = True    # H4: an empty sail is immediately followed by a BOARD onto that ferry (needs OPT_FOCUS)
+
+
+_NOTHING = float("inf")     # "no undelivered package" for the uselessness test of Rules A and C
 
 
 def _canon_edit(items, old=None, new=None):
@@ -80,7 +108,8 @@ class _State(object):
 
     Two states are equal if one becomes the other by renaming objects that are fully interchangeable
     (trucks with the same capacity, ferries of the same line and size, packages with the same weight and
-    goal). The search then expands only one of them. The key contains no action history."""
+    goal). The search then expands only one of them. The key also describes the history field (state[0]),
+    through the objects it names, so states with different pending obligations are never merged."""
     __slots__ = ("s", "k", "pr", "parts", "kh")
 
     def __init__(self, pr, s, key=None, parts=None):
@@ -1640,9 +1669,9 @@ class LogisticsProblem(search.Problem):
         T, F, P = len(tids), len(fids), len(pids)
         self.n, self.T, self.F, self.P = n, T, F, P
         self.tids, self.fids, self.pids = tids, fids, pids
-        # A state is a tuple: (0, trucks..., ferries..., packages...).
-        # The leading zero is kept for compatibility with the original tuple layout; successor generation
-        # no longer stores action history. A truck aboard ferry f is encoded as n + 2f + 1.
+        # A state is a tuple: (history, trucks..., ferries..., packages...).
+        # history: 0, or a code for "truck t is in focus" / "the next action must board ferry f" (_setup_rules).
+        # truck: location l, or n + 2f + 1 aboard ferry f after it sailed, n + 2f aboard before it sailed (H3).
         #   ferry:   the port where it is docked
         #   package: location l, or n + t (inside truck t)
         self.IF = 1 + T
@@ -1684,7 +1713,6 @@ class LogisticsProblem(search.Problem):
         # Equal numeric values can implement different LOAD comparisons.
         self.tcls = self.tcap if self.integer_cargo else range(T)
 
-        # No action-history/focus codes are kept.
 
         state = [0]
         state += [game["Trucks"][t][0] for t in tids]
@@ -1727,11 +1755,125 @@ class LogisticsProblem(search.Problem):
         self.sail_to = [() if f in dead_ferry else tuple(b for b in self.fports[f] if (f, b) not in dead_sail)
                         for f in range(F)]
         self.fdead = [f in dead_ferry for f in range(F)]
-        self._por = (_Stubborn(self) if OPT_PARTIAL_ORDER and self.integer_cargo
+        self._setup_rules()
+        self._por = (_Stubborn(self) if OPT_PARTIAL_ORDER and self.integer_cargo and not self.new_rules
                      and all(type(k) is int and k >= 1 for k in self.fcap)
                      and not OPT_BARREN else None)
 
     # ------------------------------------------------------------------ precomputation on the map
+    def _setup_rules(self):
+        """Static data for Rules A-D of SUCCESSOR_RULES_PROOF.md. Everything here is computed on the map and on
+        the fixed instance data (no state is searched)."""
+        n, T, F, P = self.n, self.T, self.F, self.P
+        exact = self.integer_cargo
+        self.use_sail = OPT_EMPTY_SAIL and exact
+        self.use_effcap = OPT_EFFCAP and exact
+        self.use_useless = OPT_USELESS and exact
+        self.use_toward = OPT_TOWARD and exact
+        self.new_rules = self.use_sail or self.use_effcap or self.use_useless or self.use_toward
+        hist = OPT_HISTORY and exact
+        self.use_focus = hist and OPT_FOCUS
+        self.use_uturn = hist and OPT_FOCUS and OPT_UTURN
+        self.use_fresh = hist and OPT_FRESH
+        self.use_needboard = hist and OPT_FOCUS and OPT_NEEDBOARD
+        self.use_history = self.use_focus or self.use_needboard
+        # history codes in state[0]: 0 none, 1 + t * (n + 1) + prev for "truck t in focus, came from prev"
+        # (prev = n: no previous drive), need_base + f * (T + 1) + (t + 1 or 0) for "next: BOARD onto f"
+        self.need_base = 1 + T * (n + 1)
+
+        # Components of the auxiliary map graph (locations and ferry nodes), as in _build_regions.
+        group = list(range(n + F))
+
+        def find(x):
+            while group[x] != x:
+                group[x] = group[group[x]]
+                x = group[x]
+            return x
+
+        for a in range(n):
+            for b in self.adj[a]:
+                group[find(a)] = find(b)
+        for f in range(F):
+            for a in self.gports[f]:
+                group[find(a)] = find(n + f)
+        self.tcomp = [find(self.s0[1 + t]) for t in range(T)]
+        self.pcomp = [find(self.pgoal[p]) for p in range(P)]
+
+        if self.use_effcap:
+            # Rule B (Definition 3): c_bar = largest sum of package weights of the truck's component that is at
+            # most its capacity. Every reachable load is such a sum, so LOAD decisions do not change (Lemma 7).
+            weights = {}
+            for p in range(P):
+                weights.setdefault(self.pcomp[p], []).append(self.pw[p])
+            cbar = []
+            for t in range(T):
+                c = self.tcap[t]
+                ws = weights.get(self.tcomp[t], ())
+                total = sum(ws)
+                if c < 0:
+                    cbar.append(c)          # nothing ever fits, so keep the raw value (never equal to a c_bar >= 0)
+                elif c >= total:
+                    cbar.append(total)
+                else:
+                    sums = 1                # bit v set <=> v is a subset sum <= c
+                    limit = (1 << (c + 1)) - 1
+                    for w in ws:
+                        sums = (sums | (sums << w)) & limit
+                    cbar.append(sums.bit_length() - 1)
+            self.tcls = cbar
+            # k_bar = min(k, trucks of the ferry's component). sail_to and fdead are in the key, so classed
+            # ferries also agree on every static restriction of the graph H.
+            trucks_in = {}
+            for t in range(T):
+                trucks_in[self.tcomp[t]] = trucks_in.get(self.tcomp[t], 0) + 1
+            classes = {}
+            self.fcls = []
+            for f in range(F):
+                k = self.fcap[f]
+                if type(k) is int:
+                    key = (self.fports[f], self.gports[f], self.sail_to[f], self.fdead[f],
+                           min(k, trucks_in.get(find(n + f), 0)))
+                else:
+                    key = ("ferry", f)
+                self.fcls.append(classes.setdefault(key, len(classes)))
+
+        if self.use_toward:
+            # Rule D (Definition 5): toward[l][i] has bit z set when the i-th retained neighbour m of l satisfies
+            # d(m, z) = d(l, z) - 1 < infinity, with d the directed road distance over adj_go. Plain BFS on the map.
+            radj = [[] for _ in range(n)]
+            for x in range(n):
+                for y in self.adj_go[x]:
+                    radj[y].append(x)
+            unreachable = n + 1
+            dist = []
+            for z in range(n):
+                d = [unreachable] * n
+                d[z] = 0
+                queue = [z]
+                for x in queue:
+                    for y in radj[x]:
+                        if d[y] == unreachable:
+                            d[y] = d[x] + 1
+                            queue.append(y)
+                dist.append(d)
+            self.toward = []
+            for l in range(n):
+                row = []
+                for m in self.adj_go[l]:
+                    mask = 0
+                    for z in range(n):
+                        dz = dist[z]
+                        if dz[l] < unreachable and dz[m] == dz[l] - 1:
+                            mask |= 1 << z
+                    row.append(mask)
+                self.toward.append(tuple(row))
+            self.sailmask = []
+            for f in range(F):
+                mask = 0
+                for b in self.sail_to[f]:
+                    mask |= 1 << b
+                self.sailmask.append(mask)
+
     def _build_regions(self):
         """The connected parts of the map (roads + ferry routes). A package never leaves its part, so the
         parts that have packages are independent problems. They are solved one after the other."""
@@ -1981,18 +2123,30 @@ class LogisticsProblem(search.Problem):
                 if load + w <= self.tcap[t]:
                     ns = list(st)
                     ns[IP + p] = n + t
-                    ns[0] = 0
+                    ns[0] = 1 + t * (n + 1) + n if self.use_focus else 0
                     res.append(("LOAD{%d,%d}" % (self.pids[p], tid), tuple(ns)))
                     if changes is not None:
                         changes.append(("load", t, p))
+        focus = 1 + t * (n + 1) + l if self.use_focus else 0
         if cont:
             for w in self.adj_go[l]:
                 ns = list(st)
                 ns[1 + t] = w
-                ns[0] = 0
+                ns[0] = focus
                 res.append(("DRIVE{%d,%d,%d}" % (tid, l, w), tuple(ns)))
                 if changes is not None:
                     changes.append(("drive", t, None))
+        elif self.use_toward:
+            # Rule D: an empty standing truck drives only along a shortest road path to one of its targets.
+            target = self._target_mask(t)
+            for w, mask in zip(self.adj_go[l], self.toward[l]):
+                if mask & target:
+                    ns = list(st)
+                    ns[1 + t] = w
+                    ns[0] = focus
+                    res.append(("DRIVE{%d,%d,%d}" % (tid, l, w), tuple(ns)))
+                    if changes is not None:
+                        changes.append(("drive", t, None))
         else:
             # OPT_BARREN is currently disabled. The code path remains available for a future proof.
             useful = self._useful
@@ -2000,7 +2154,7 @@ class LogisticsProblem(search.Problem):
                 if not far or far & useful:
                     ns = list(st)
                     ns[1 + t] = w
-                    ns[0] = 0
+                    ns[0] = focus
                     res.append(("DRIVE{%d,%d,%d}" % (tid, l, w), tuple(ns)))
                     if changes is not None:
                         changes.append(("drive", t, None))
@@ -2030,11 +2184,25 @@ class LogisticsProblem(search.Problem):
                         continue
                     seen.add(key)
                 ns = list(st)
-                ns[1 + t] = code0 + 1
+                ns[1 + t] = code0 if self.use_fresh else code0 + 1      # even code: boarded, not yet sailed
                 ns[0] = 0
                 res.append(("BOARD{%d,%d}" % (tid, self.fids[f]), tuple(ns)))
                 if changes is not None:
                     changes.append(("board", t, f))
+
+    def _target_mask(self, t):
+        """Targets of an empty standing truck t as a bit mask over locations (Definition 5): T1 from the lying
+        undelivered packages it can carry, T2 and T3 from the ferries. Locations outside the truck's component
+        may be set too, but toward[][] has bits only for road-reachable locations, so they never match."""
+        c = self.tcap[t]
+        mask = self._t_cache.get(c)
+        if mask is None:
+            mask = self._t_ferry
+            for bit, weight in self._t_lying:
+                if weight <= c:
+                    mask |= bit
+            self._t_cache[c] = mask
+        return mask
 
     def _finish(self, ns):
         """The active part of the map is done: its trucks and ferries never act again, so forget where they are."""
@@ -2050,7 +2218,7 @@ class LogisticsProblem(search.Problem):
 
     def successor(self, state):
         """ Generates the successor states returns [(action, achieved_states, ...)]"""
-        if not OPT_INCREMENTAL_CANON or not OPT_SYM:
+        if not OPT_INCREMENTAL_CANON or not OPT_SYM or self.use_history or self.use_fresh:
             return [(action, _State(self, s)) for action, s in self._successors(state.s)]
         changes = []
         raw = self._successors(state.s, changes)
@@ -2179,7 +2347,7 @@ class LogisticsProblem(search.Problem):
                 if aboard is None:
                     aboard = {}
                 f = (tc - n) >> 1
-                d = (tcls[t], c)
+                d = (tcls[t], c, (tc - n) & 1) if self.use_fresh else (tcls[t], c)
                 if f in aboard:
                     aboard[f].append(d)
                 else:
@@ -2195,7 +2363,123 @@ class LogisticsProblem(search.Problem):
             else:
                 ferries.append((fcls[f], s[IF + f], ()))
         ferries.sort()
-        return (tuple(standing), tuple(ferries), tuple(lying))
+        h = s[0]
+        if not h:
+            return (tuple(standing), tuple(ferries), tuple(lying))
+        # History is described through the objects it names, so renamings of interchangeable objects agree.
+        def truck_key(t):
+            c = cont[t]
+            return (s[1 + t], tcls[t], tuple(sorted(c)) if c else ())
+        if h < self.need_base:
+            t, prev = divmod(h - 1, n + 1)
+            extra = ("focus", truck_key(t), prev)
+        else:
+            f, r = divmod(h - self.need_base, T + 1)
+            extra = ("board", fcls[f], s[IF + f], truck_key(r - 1) if r else None)   # f is empty here
+        return (tuple(standing), tuple(ferries), tuple(lying), extra)
+
+    def _prepare_rules(self, state, inside, lying, aboard_count):
+        """Per-expansion data of Rules A, C, D (SUCCESSOR_RULES_PROOF.md, Definitions 1, 2, 5).
+        Returns (lightest undelivered weight per component, mask of locations with a truck that is not useless)
+        and sets the target masks that _target_mask reads."""
+        n, T, F, P, IF, IP = self.n, self.T, self.F, self.P, self.IF, self.IP
+        lightest = None
+        standing = 0
+        if self.use_useless or self.use_sail:
+            # A truck is useless if it stands empty and every undelivered package of its component is heavier
+            # than its capacity, that is, if its capacity is below the lightest such package.
+            lightest = {}
+            pcomp, pw, pgoal = self.pcomp, self.pw, self.pgoal
+            for p in range(P):
+                c = state[IP + p]
+                if c >= n or c != pgoal[p]:
+                    k = pcomp[p]
+                    w = pw[p]
+                    if w < lightest.get(k, _NOTHING):
+                        lightest[k] = w
+            tcomp, tcap = self.tcomp, self.tcap
+            for t in range(T):
+                tc = state[1 + t]
+                if tc < n and (inside[t] or tcap[t] >= lightest.get(tcomp[t], _NOTHING)):
+                    standing |= 1 << tc
+        if self.use_toward:
+            ferries = 0                 # T2: docks with a free slot, T3: ports an empty ferry can sail to
+            fcap = self.fcap
+            for f in range(F):
+                if not self.fdead[f]:
+                    occupied = aboard_count[f]
+                    if occupied < fcap[f]:
+                        ferries |= 1 << state[IF + f]
+                        if not occupied:
+                            ferries |= self.sailmask[f]
+            self._t_ferry = ferries
+            pw = self.pw
+            self._t_lying = [(1 << loc, min(pw[p] for p in here)) for loc, here in lying.items()]
+            self._t_cache = {}
+        return lightest, standing
+
+    def _history_successors(self, state, hist, inside, lying, aboard_count, res):
+        """Successors of a state whose leading field records history (HISTORY_RULES_PROOF.md):
+        "truck t is in focus" (H1, H2) or "the next action must be a BOARD onto ferry f" (H4)."""
+        n, T, IF = self.n, self.T, self.IF
+        if hist < self.need_base:
+            t, prev = divmod(hist - 1, n + 1)
+            need = -1
+        else:
+            need, r = divmod(hist - self.need_base, T + 1)
+            t = r - 1
+            prev = n
+        if need >= 0:
+            # H4: only a BOARD onto `need`, by the focus truck if there is one, else by a truck standing there.
+            f = need
+            dock = state[IF + f]
+            if not aboard_count[f] < self.fcap[f]:
+                return res
+            code0 = n + 2 * f
+            seen = set()
+            for t2 in ([t] if t >= 0 else range(T)):
+                if state[1 + t2] != dock or (self.multi and self.trank[t2] != self._rank):
+                    continue
+                if not inside[t2] and OPT_TWINS:
+                    key = (dock, self.tcls[t2])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                ns = list(state)
+                ns[1 + t2] = code0 if self.use_fresh else code0 + 1
+                ns[0] = 0
+                res.append(("BOARD{%d,%d}" % (self.tids[t2], self.fids[f]), tuple(ns)))
+            return res
+        # H1: only actions of the focus truck t, which stands at l.
+        l = state[1 + t]
+        cont = inside[t]
+        self._prepare_rules(state, inside, lying, aboard_count)
+        mine = []
+        self._truck_standing(state, t, l, cont, lying, mine,
+                             aboard_count=aboard_count if OPT_OCCUPANCY_REUSE else None)
+        for action, child in mine:
+            if self.use_uturn and prev < n and child[1 + t] == prev:
+                continue                # H2: a drive straight back to where the truck came from
+            res.append((action, child))
+        forced = cont and any(self.pgoal[p] == l for p in cont)
+        if self.F and not forced:
+            # H1 exception: an empty ferry may come to the focus truck, which then boards it (H4 if on).
+            seen = set()
+            for f in range(self.F):
+                if self.fdead[f] or aboard_count[f] or not 0 < self.fcap[f] or l not in self.sail_to[f]:
+                    continue
+                dock = state[IF + f]
+                if dock == l:
+                    continue
+                if OPT_TWINS:
+                    key = (dock, self.fcls[f])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                action, child = self._sail(state, f, dock, l)
+                after = self.need_base + f * (T + 1) + t + 1 if self.use_needboard else hist
+                res.append((action, (after,) + child[1:]))
+        return res
 
     def _successors(self, state, changes=None):
         """The successors of the tuple of a state: [(action, tuple), ...]
@@ -2206,13 +2490,16 @@ class LogisticsProblem(search.Problem):
         3. Use one representative among truly interchangeable packages/trucks/ferries.
         4. Do not enter precomputed dead map sides / dominated ports.
         5. Solve independent map components in a canonical component order.
-        6. Optional strong stubborn sets retain a provably optimal next-action choice.
-        Endpoint-only corridor transfers are disabled: they can lose optimal retained-state suffixes.
-
-        History-dependent pruning was removed. In particular, there is no truck focus, no post-LOAD order
-        restriction, no U-turn ban, no fresh-board restriction, and no forced BOARD after an empty sail.
-        OPT_BARREN is disabled until it has a proof that does not rely on focus.
-        See PARTIAL_ORDER_PROOF.md for the enabled reductions and their combination."""
+        6. Optional strong stubborn sets retain a provably optimal next-action choice (off while 7-10 are on).
+        7. Rule A: an empty ferry sails only to a port where a truck that is not useless stands.
+        8. Rule B: twins and merged states use effective capacities.
+        9. Rule C: an empty standing truck that cannot carry any undelivered package never acts.
+        10. Rule D: an empty standing truck drives only along a shortest road path to one of its targets.
+        Rules 7-10 are proved in SUCCESSOR_RULES_PROOF.md.
+        11. H1 focus, H2 no U-turn, H3 fresh board, H4 board next, and corridor transfers only at anchors
+            (OPT_CORRIDOR), proved in HISTORY_RULES_PROOF.md under the initial-state reading. States with a
+            history code go through _history_successors.
+        OPT_BARREN stays disabled."""
         n = self.n
         T = self.T
         F = self.F
@@ -2275,6 +2562,9 @@ class LogisticsProblem(search.Problem):
 
         tcls = self.tcls
         trank = self.trank
+        hist = state[0]
+        if hist and self.use_history:
+            return self._history_successors(state, hist, inside, lying, aboard_count, res)
         if OPT_FORCED and self.integer_cargo:
             for t, cargo in enumerate(inside):
                 if cargo and (not multi or trank[t] == rank):
@@ -2283,12 +2573,19 @@ class LogisticsProblem(search.Problem):
                         self._truck_standing(state, t, loc, cargo, lying, res, changes,
                                              aboard_count=board_occupancy)
                         return res
+        use_useless = self.use_useless
+        use_sail = self.use_sail
+        lightest, standing = self._prepare_rules(state, inside, lying, aboard_count)
+
         seen_t = set()
         for t in range(T):
             if multi and trank[t] != rank:
                 continue
             tc = state[1 + t]
             cont = inside[t]
+            if (use_useless and not cont and tc < n
+                    and self.tcap[t] < lightest.get(self.tcomp[t], _NOTHING)):
+                continue                # Rule C. Its twins are useless too, so no representative is lost.
             if not cont and OPT_TWINS:
                 key = (tc, tcls[t])
                 if key in seen_t:
@@ -2298,6 +2595,8 @@ class LogisticsProblem(search.Problem):
                 self._truck_standing(state, t, tc, cont, lying, res, changes,
                                      aboard_count=board_occupancy)
             else:
+                if self.use_fresh and not (tc - n) & 1:
+                    continue            # H3: boarded but not yet sailed, disembarking now would undo the BOARD
                 f = (tc - n) >> 1
                 ns = list(state)
                 ns[1 + t] = state[IF + f]
@@ -2319,9 +2618,14 @@ class LogisticsProblem(search.Problem):
                         if key in seen_f:
                             continue
                         seen_f.add(key)
+                lazy = use_sail and not aboard_count[f]
+                if lazy and not 0 < self.fcap[f]:
+                    continue            # Rule A: nobody can ever board, so an empty sail is never needed
+                need = self.need_base + f * (T + 1) if self.use_needboard and not aboard_count[f] else 0
                 for b in self.sail_to[f]:
-                    if b != port:
-                        res.append(self._sail(state, f, port, b))
+                    if b != port and (not lazy or (standing >> b) & 1):
+                        action, child = self._sail(state, f, port, b)
+                        res.append((action, (need,) + child[1:]) if need else (action, child))
                         if changes is not None:
                             changes.append(("sail", f, None))
         if OPT_PARTIAL_ORDER and self._por is not None:
@@ -2348,7 +2652,8 @@ class LogisticsProblem(search.Problem):
         state = node.state.s
         if self.dead:
             return 0            # the initial layout has a package separated from its goal
-        # the leading field of a state is always 0, so the tuple itself is the key
+        if state[0]:
+            state = (0,) + state[1:]    # the leading field only holds search history, which h never reads
         h = self.hcache.get(state)
         if h is None:
             h = self.hcache[state] = self._h(state)

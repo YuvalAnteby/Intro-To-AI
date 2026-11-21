@@ -748,8 +748,10 @@ equality to a fresh evaluation. All caches belong to one fixed problem instance.
 
 **Keys used by the implementation.**
 
-- `hcache`: the complete raw state tuple. It stores an already obtained admissible answer for that same
-  state. The unused `hcache2` attribute is initialized but is not read or written by `h_astar` or `_h`.
+- `hcache`: the raw state tuple with its leading field set to 0 (`h_astar` normalizes it before the lookup,
+  since the history field of the condition-(1) file is never read by h). Without history that field is always 0,
+  so the key is the complete raw tuple. It stores an already obtained admissible answer for that state, which is
+  admissible for every state sharing the key, because h reads nothing that differs between them. The unused `hcache2` attribute is initialized but is not read or written by `h_astar` or `_h`.
 - `reg.cache`, one region: all truck nodes, all ferry docks, and, for every undelivered package, its ID
   and node. It also retains the holder when the package is aboard a ferry or has a goal in `merge_goals`.
   For multiple regions, `reg.sig(state)` instead retains the raw codes of that region's objects.

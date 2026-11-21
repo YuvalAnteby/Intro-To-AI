@@ -37,6 +37,12 @@
 #     earlier history-based version of this file, wrote their proof (HISTORY_RULES_PROOF.md, including a
 #     re-derivation of the corridor rule, which is switched on under that reading), implemented them, and
 #     extended the exhaustive checker with a mode for that reading.
+#   - After an outside review found that the no-U-turn filter tested the truck's position instead of the drive
+#     action (so the delivery that completes a component could be dropped after the vehicle reset), fixed the
+#     filter, corrected the proof, and made the checker generate the instances that expose such bugs.
+#   - After a second review: Rule B's subset sums no longer overflow on huge integer weights (exact sums with
+#     bounded memory, otherwise Rule B is off for the instance), the proofs state their scope more precisely,
+#     and the checker compares the pruned optimum across states with equal canonical keys.
 #
 # Python's hash contract and tuple-hash implementation notes were consulted for the hash cache:
 # https://docs.python.org/3/reference/datamodel.html#object.__hash__
@@ -61,7 +67,7 @@ OPT_SYM = True        # states that differ only by a renaming of identical objec
 OPT_DEAD = True       # never enter a dead end of the map where there is nothing to do
 OPT_BARREN = False    # disabled pending a proof that does not rely on truck focus
 OPT_FIRST = True      # heuristic only: first-entry lower bound
-OPT_CORRIDOR = True   # transfers only at anchors: valid under condition 1 (PRUNING_PROOF.md section 8), not under 2
+OPT_CORRIDOR = True   # transfers only at anchors: valid under condition 1 (HISTORY_RULES_PROOF.md Lemma 1), not under 2
 
 # Representation only: compute the same canonical key from the parent's key and the action.
 OPT_INCREMENTAL_CANON = False
@@ -69,11 +75,15 @@ OPT_OCCUPANCY_REUSE = True  # reuse parent-state ferry counts for all BOARD chec
 OPT_HASH_CACHE = False      # profiling found no benefit on the target Python 3.12 runtime
 OPT_PARTIAL_ORDER = False   # proved safe; opt in to benchmark (PARTIAL_ORDER_PROOF.md)
 
-# State-based successor rules, proved in SUCCESSOR_RULES_PROOF.md. They read only the current state, so every
-# retained state keeps its world-optimal continuation. Active only with integer weights and capacities.
+# State-based successor rules, proved in SUCCESSOR_RULES_PROOF.md. They read only the current state. In the
+# configuration that proof covers (history, corridor, barren and partial-order rules off) every retained state keeps
+# its world-optimal continuation. The delivered defaults turn history and corridors on, and then the guarantee is
+# the initial-state one of HISTORY_RULES_PROOF.md. Active only with integer weights and capacities.
 # OPT_PARTIAL_ORDER is ignored while any of them is on (its proof assumes the old successor list).
 OPT_EMPTY_SAIL = True   # Rule A: an empty ferry sails only to a port where a truck that is not useless stands
 OPT_EFFCAP = True       # Rule B: twin/merge classes by effective capacity (reachable load, usable truck slots)
+_DENSE_BITS = 1 << 20   # Rule B: a capacity up to this is handled with a bitset of subset sums
+_SUBSET_SUMS = 1 << 16  # Rule B: above it, at most this many distinct sums, else Rule B is off for the instance
 OPT_USELESS = True      # Rule C: an empty standing truck that cannot carry any undelivered package never acts
 OPT_TOWARD = True       # Rule D: an empty standing truck drives only along a shortest road path to a target
 
@@ -1757,10 +1767,28 @@ class LogisticsProblem(search.Problem):
         self.fdead = [f in dead_ferry for f in range(F)]
         self._setup_rules()
         self._por = (_Stubborn(self) if OPT_PARTIAL_ORDER and self.integer_cargo and not self.new_rules
+                     and not self.use_history and not self.use_fresh and not OPT_CORRIDOR
                      and all(type(k) is int and k >= 1 for k in self.fcap)
                      and not OPT_BARREN else None)
 
     # ------------------------------------------------------------------ precomputation on the map
+    @staticmethod
+    def _best_load(c, ws):
+        """Rule B: the largest subset sum of the weights ws that is at most c (every w in ws is at most c), or None
+        when a capacity above _DENSE_BITS would need more than _SUBSET_SUMS distinct sums."""
+        if c <= _DENSE_BITS:
+            sums = 1                    # bit v set <=> v is a subset sum <= c
+            limit = (1 << (c + 1)) - 1
+            for w in ws:
+                sums = (sums | (sums << w)) & limit
+            return sums.bit_length() - 1
+        sums = {0}                      # the same set of subset sums <= c, stored sparsely
+        for w in ws:
+            sums |= {v + w for v in sums if v + w <= c}
+            if len(sums) > _SUBSET_SUMS:
+                return None
+        return max(sums)
+
     def _setup_rules(self):
         """Static data for Rules A-D of SUCCESSOR_RULES_PROOF.md. Everything here is computed on the map and on
         the fixed instance data (no state is searched)."""
@@ -1815,12 +1843,17 @@ class LogisticsProblem(search.Problem):
                 elif c >= total:
                     cbar.append(total)
                 else:
-                    sums = 1                # bit v set <=> v is a subset sum <= c
-                    limit = (1 << (c + 1)) - 1
-                    for w in ws:
-                        sums = (sums | (sums << w)) & limit
-                    cbar.append(sums.bit_length() - 1)
-            self.tcls = cbar
+                    best = self._best_load(c, [w for w in ws if w <= c])   # a heavier package never fits
+                    if best is None:
+                        break
+                    cbar.append(best)
+            if len(cbar) < T:
+                # Too many distinct subset sums under a huge capacity: Rule B is switched off for this instance,
+                # which both proofs cover. tcls and fcls keep their raw values from the constructor.
+                self.use_effcap = False
+            else:
+                self.tcls = cbar
+        if self.use_effcap:
             # k_bar = min(k, trucks of the ferry's component). sail_to and fdead are in the key, so classed
             # ferries also agree on every static restriction of the graph H.
             trucks_in = {}
@@ -2457,9 +2490,11 @@ class LogisticsProblem(search.Problem):
         mine = []
         self._truck_standing(state, t, l, cont, lying, mine,
                              aboard_count=aboard_count if OPT_OCCUPANCY_REUSE else None)
+        back = "DRIVE{%d,%d,%d}" % (self.tids[t], l, prev) if self.use_uturn and prev < n else None
         for action, child in mine:
-            if self.use_uturn and prev < n and child[1 + t] == prev:
-                continue                # H2: a drive straight back to where the truck came from
+            if action == back:
+                continue                # H2: only an actual DRIVE straight back (a forced UNLOAD that completes
+                                        # a component can also put the truck at prev, through the _finish reset)
             res.append((action, child))
         forced = cont and any(self.pgoal[p] == l for p in cont)
         if self.F and not forced:
@@ -2677,9 +2712,8 @@ class LogisticsProblem(search.Problem):
                 f = (tc - n) >> 1
                 tnode[t] = n + f
                 tfer[t] = f
-        # A second cache keyed by (truck nodes, the rest of the state) used to sit here. It could never hit
-        # after a miss of hcache: it only folded the truck codes n + 2f and n + 2f + 1 together, and the
-        # successor function never produces n + 2f. So the bound is computed directly.
+        # Both aboard codes n + 2f (boarded, not yet sailed, rule H3) and n + 2f + 1 decode to ferry f here, so
+        # the bound sees only the physical state. h_astar's cache key drops the history field state[0].
         return self._bound(state, tnode, tfer)
 
     def _bound(self, state, tnode, tfer):
@@ -2712,10 +2746,11 @@ class LogisticsProblem(search.Problem):
                     bucket.append((p, tnode[c - n], c - n))
             if bucket:
                 reg = self.regions[0]
-                # Custody affects movement only for merging groups or cargo aboard a ferry. A package carried
-                # by a standing truck and one lying at the same place give the same value: the carrying
-                # truck can carry it and stands at that node, so neither version sets a visit flag
-                # (proof, Section 16). So a LOAD or UNLOAD child reuses its parent's value.
+                # The key keeps custody only for merging groups or cargo aboard a ferry. A package carried by a
+                # standing truck and one lying at the same place share a key, so a LOAD or UNLOAD child may
+                # reuse its parent's value. This reuse preserves admissibility only: a fresh computation for
+                # either state can give a different value (the set of cycle centres can differ), and a value
+                # stored for either one is a lower bound for the other (ADMISSIBILITY_PROOF.md, Lemma 13).
                 key = (tuple(tnode), state[self.IF:IP],
                        tuple((p, site, hol if site >= n or pgoal[p] in reg.merge_goals else -1)
                              for p, site, hol in bucket))
